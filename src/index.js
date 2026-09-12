@@ -10,6 +10,7 @@ import { checkInRouter } from './routes/checkin.routes.js'
 import { adminRouter } from './routes/admin.routes.js'
 import { professionalRouter } from './routes/professional.routes.js'
 import { appointmentRouter } from './routes/appointment.routes.js'
+import { clientRouter } from './routes/client.routes.js'
 
 const app = express()
 
@@ -27,6 +28,7 @@ app.use('/api/check-ins', checkInRouter)
 app.use('/api/admin', adminRouter)
 app.use('/api/professionals', professionalRouter)
 app.use('/api/appointments', appointmentRouter)
+app.use('/api/clients', clientRouter)
 
 // Centralised error handler — keeps stack traces out of prod responses.
 app.use((err, _req, res, _next) => {
