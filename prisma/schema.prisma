@@ -1,0 +1,267 @@
+// Mindora database schema.
+//
+// Design principles baked in:
+// 1. Identity is separated from sensitive screening content where practical,
+//    so a data leak of one table doesn't automatically expose the other.
+// 2. Every role (User, Professional, Admin) is a distinct model with its own
+//    auth, not a single "users" table with a role flag — this makes it much
+//    harder to accidentally leak professional/admin privileges to a user record.
+// 3. AuditLog exists from day one. Retrofitting audit logging onto a health
+//    data system after the fact is painful and error-prone — build it in now,
+//    even if nothing depends on it yet.
+// 4. Referral and ClinicalNote are the two most sensitive tables — access to
+//    these should always go through application-level authorization checks,
+//    never a raw unrestricted query.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum RiskLevel {
+  LOW
+  ELEVATED
+  HIGH
+  ACUTE
+}
+
+enum ReferralStatus {
+  PENDING
+  ACCEPTED
+  MORE_INFO_REQUESTED
+  ESCALATED
+  CLOSED
+}
+
+enum AppointmentType {
+  ONLINE
+  IN_PERSON
+}
+
+enum AppointmentStatus {
+  SCHEDULED
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+}
+
+enum ProfessionalType {
+  PSYCHOLOGIST
+  CLINICAL_PSYCHOLOGIST
+  PSYCHIATRIST
+}
+
+enum AdminRole {
+  PLATFORM_ADMIN
+  CLINICAL_SAFETY_REVIEWER
+  SUPPORT
+}
+
+// ---------------------------------------------------------------------------
+// Identity
+// ---------------------------------------------------------------------------
+
+model User {
+  id            String   @id @default(uuid())
+  email         String   @unique
+  passwordHash  String
+  fullName      String
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  checkIns      CheckIn[]
+  referrals     Referral[]
+  appointments  Appointment[]
+  auditLogs     AuditLog[]
+
+  @@map("users")
+}
+
+model Professional {
+  id              String            @id @default(uuid())
+  email           String            @unique
+  passwordHash    String
+  fullName        String
+  type            ProfessionalType
+  bio             String?
+  qualifications  String[]
+  focusAreas      String[]
+  languages       String[]
+  yearsExperience Int               @default(0)
+  location        String?
+  feeKes          Int?
+  onlineAvailable Boolean           @default(true)
+  inPersonAvailable Boolean         @default(false)
+  verified        Boolean           @default(false)
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  referrals       Referral[]
+  appointments    Appointment[]
+  clinicalNotes   ClinicalNote[]
+  auditLogs       AuditLog[]
+
+  @@map("professionals")
+}
+
+model Admin {
+  id           String    @id @default(uuid())
+  email        String    @unique
+  passwordHash String
+  fullName     String
+  role         AdminRole @default(SUPPORT)
+  createdAt    DateTime  @default(now())
+
+  auditLogs    AuditLog[]
+
+  @@map("admins")
+}
+
+// ---------------------------------------------------------------------------
+// Screening & wellbeing
+// ---------------------------------------------------------------------------
+
+// One completed check-in. Raw per-question answers live in CheckInAnswer so
+// the aggregate score can be read/displayed without touching granular
+// responses unless specifically needed (e.g. professional review).
+model CheckIn {
+  id         String    @id @default(uuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  riskLevel  RiskLevel
+  totalScore Int
+  maxScore   Int
+  completedAt DateTime @default(now())
+
+  answers    CheckInAnswer[]
+  referral   Referral?
+
+  @@index([userId, completedAt])
+  @@map("check_ins")
+}
+
+model CheckInAnswer {
+  id         String   @id @default(uuid())
+  checkInId  String
+  checkIn    CheckIn  @relation(fields: [checkInId], references: [id], onDelete: Cascade)
+  domain     String   // e.g. "mood", "sleep", "anxiety"
+  questionId String
+  value      Int      // 0-3, per PHQ/GAD-style response scale
+
+  @@map("check_in_answers")
+}
+
+// ---------------------------------------------------------------------------
+// Referral & clinical workflow
+// ---------------------------------------------------------------------------
+
+model Referral {
+  id             String         @id @default(uuid())
+  userId         String
+  user           User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  checkInId      String         @unique
+  checkIn        CheckIn        @relation(fields: [checkInId], references: [id], onDelete: Cascade)
+  professionalId String?
+  professional   Professional?  @relation(fields: [professionalId], references: [id])
+  status         ReferralStatus @default(PENDING)
+  reason         String
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  flags          ReferralFlag[]
+
+  @@index([professionalId, status])
+  @@map("referrals")
+}
+
+model ReferralFlag {
+  id         String   @id @default(uuid())
+  referralId String
+  referral   Referral @relation(fields: [referralId], references: [id], onDelete: Cascade)
+  label      String
+
+  @@map("referral_flags")
+}
+
+model Appointment {
+  id             String            @id @default(uuid())
+  userId         String
+  user           User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  professionalId String
+  professional   Professional      @relation(fields: [professionalId], references: [id], onDelete: Cascade)
+  scheduledFor   DateTime
+  type           AppointmentType
+  status         AppointmentStatus @default(SCHEDULED)
+  feeKes         Int
+  createdAt      DateTime          @default(now())
+
+  @@index([professionalId, scheduledFor])
+  @@index([userId, scheduledFor])
+  @@map("appointments")
+}
+
+// Clinical notes are the most sensitive table in the schema after raw
+// check-in answers. Access must always be scoped to the authoring
+// professional (or an authorised clinical reviewer) at the application layer.
+model ClinicalNote {
+  id             String       @id @default(uuid())
+  professionalId String
+  professional   Professional @relation(fields: [professionalId], references: [id], onDelete: Cascade)
+  userId         String
+  content        String
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  @@index([professionalId, userId])
+  @@map("clinical_notes")
+}
+
+// ---------------------------------------------------------------------------
+// Safety / escalation
+// ---------------------------------------------------------------------------
+
+model SafetyAlert {
+  id          String    @id @default(uuid())
+  referralId  String?
+  userId      String?
+  riskLevel   RiskLevel
+  note        String
+  resolvedAt  DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([riskLevel, resolvedAt])
+  @@map("safety_alerts")
+}
+
+// ---------------------------------------------------------------------------
+// Audit logging — who accessed/changed what, and when.
+// Non-negotiable for a system holding mental-health data.
+// ---------------------------------------------------------------------------
+
+model AuditLog {
+  id             String        @id @default(uuid())
+  actorType      String        // "user" | "professional" | "admin" | "system"
+  userId         String?
+  user           User?         @relation(fields: [userId], references: [id])
+  professionalId String?
+  professional   Professional? @relation(fields: [professionalId], references: [id])
+  adminId        String?
+  admin          Admin?        @relation(fields: [adminId], references: [id])
+  action         String        // e.g. "referral.view", "clinical_note.create"
+  resourceType   String
+  resourceId     String?
+  metadata       Json?
+  createdAt      DateTime      @default(now())
+
+  @@index([resourceType, resourceId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
