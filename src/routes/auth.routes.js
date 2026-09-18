@@ -111,6 +111,6 @@ authRouter.post('/admin/login', async (req, res) => {
     return res.status(401).json({ error: 'Invalid email or password.' })
   }
 
-  const token = signToken({ id: admin.id, role: 'admin' })
+  const token = signToken({ id: admin.id, role: 'admin', adminRole: admin.role })
   res.json({ token, admin: { id: admin.id, fullName: admin.fullName, role: admin.role } })
 })

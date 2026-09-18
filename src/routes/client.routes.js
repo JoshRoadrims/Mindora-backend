@@ -1,14 +1,11 @@
 import { Router } from 'express'
 import { z } from 'zod'
 import { prisma } from '../lib/prisma.js'
-import { requireAuth, requireRole } from '../middleware/auth.js'
+import { requireAuth, requireRole, requireAgreement } from '../middleware/auth.js'
 import { audit } from '../lib/audit.js'
 
 export const clientRouter = Router()
 
-// A "client" of a professional is any user with an accepted referral or a
-// booked appointment with them — there's no separate client-roster table,
-// this is derived from the two relationships that actually exist.
 async function getClientUserIds(professionalId) {
   const [referrals, appointments] = await Promise.all([
     prisma.referral.findMany({
@@ -23,7 +20,7 @@ async function getClientUserIds(professionalId) {
   return Array.from(new Set([...referrals.map((r) => r.userId), ...appointments.map((a) => a.userId)]))
 }
 
-clientRouter.get('/', requireAuth, requireRole('professional'), async (req, res) => {
+clientRouter.get('/', requireAuth, requireRole('professional'), requireAgreement, async (req, res) => {
   const userIds = await getClientUserIds(req.auth.id)
 
   const clients = await Promise.all(
@@ -50,7 +47,7 @@ clientRouter.get('/', requireAuth, requireRole('professional'), async (req, res)
   res.json(clients)
 })
 
-clientRouter.get('/:userId', requireAuth, requireRole('professional'), async (req, res) => {
+clientRouter.get('/:userId', requireAuth, requireRole('professional'), requireAgreement, async (req, res) => {
   const { userId } = req.params
   const clientIds = await getClientUserIds(req.auth.id)
 
@@ -87,7 +84,7 @@ clientRouter.get('/:userId', requireAuth, requireRole('professional'), async (re
 
 const noteSchema = z.object({ content: z.string().min(1) })
 
-clientRouter.post('/:userId/notes', requireAuth, requireRole('professional'), async (req, res) => {
+clientRouter.post('/:userId/notes', requireAuth, requireRole('professional'), requireAgreement, async (req, res) => {
   const { userId } = req.params
   const clientIds = await getClientUserIds(req.auth.id)
   if (!clientIds.includes(userId)) {

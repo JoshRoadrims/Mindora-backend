@@ -14,7 +14,7 @@ async function main() {
 
   const professional = await prisma.professional.upsert({
     where: { email: 'sarah.mwangi@example.com' },
-    update: {},
+    update: { verified: true },
     create: {
       fullName: 'Dr. Sarah Mwangi',
       email: 'sarah.mwangi@example.com',
@@ -33,14 +33,36 @@ async function main() {
     },
   })
 
-  const admin = await prisma.admin.upsert({
+  const platformAdmin = await prisma.admin.upsert({
     where: { email: 'admin@mindora.local' },
-    update: {},
+    update: { role: 'PLATFORM_ADMIN' },
     create: {
       fullName: 'Mindora Platform Team',
       email: 'admin@mindora.local',
       passwordHash,
       role: 'PLATFORM_ADMIN',
+    },
+  })
+
+  const safetyReviewer = await prisma.admin.upsert({
+    where: { email: 'safety@mindora.local' },
+    update: { role: 'CLINICAL_SAFETY_REVIEWER' },
+    create: {
+      fullName: 'Mindora Clinical Safety',
+      email: 'safety@mindora.local',
+      passwordHash,
+      role: 'CLINICAL_SAFETY_REVIEWER',
+    },
+  })
+
+  const support = await prisma.admin.upsert({
+    where: { email: 'support@mindora.local' },
+    update: { role: 'SUPPORT' },
+    create: {
+      fullName: 'Mindora Support',
+      email: 'support@mindora.local',
+      passwordHash,
+      role: 'SUPPORT',
     },
   })
 
@@ -77,7 +99,13 @@ async function main() {
     },
   })
 
-  console.log('Seed complete:', { user: user.email, professional: professional.email, admin: admin.email })
+  console.log('Seed complete:', {
+    user: user.email,
+    professional: professional.email,
+    platformAdmin: platformAdmin.email,
+    safetyReviewer: safetyReviewer.email,
+    support: support.email,
+  })
 }
 
 main()

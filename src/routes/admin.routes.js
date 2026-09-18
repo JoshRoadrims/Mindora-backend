@@ -1,111 +1,330 @@
 import { Router } from 'express'
 import { z } from 'zod'
 import { prisma } from '../lib/prisma.js'
-import { requireAuth, requireRole } from '../middleware/auth.js'
+import { requireAuth, requireRole, requireAdminRole } from '../middleware/auth.js'
 import { audit } from '../lib/audit.js'
 
 export const adminRouter = Router()
 
-// Platform-wide counts. Cheap enough to compute on read at this scale;
-// revisit with caching/materialized views once volumes grow.
-adminRouter.get('/overview', requireAuth, requireRole('admin'), async (req, res) => {
-  const [totalUsers, assessmentsCompleted, referralsMade, professionalsOnNetwork] =
-    await Promise.all([
-      prisma.user.count(),
-      prisma.checkIn.count(),
-      prisma.referral.count(),
-      prisma.professional.count({ where: { verified: true } }),
-    ])
+// Every admin tier can see the platform overview — it's high-level counts,
+// no clinical or account-identifiable detail.
+adminRouter.get(
+  '/overview',
+  requireAuth,
+  requireAdminRole('PLATFORM_ADMIN', 'CLINICAL_SAFETY_REVIEWER', 'SUPPORT'),
+  async (req, res) => {
+    const [totalUsers, assessmentsCompleted, referralsMade, professionalsOnNetwork] =
+      await Promise.all([
+        prisma.user.count(),
+        prisma.checkIn.count(),
+        prisma.referral.count(),
+        prisma.professional.count({ where: { verified: true } }),
+      ])
 
-  await audit({
-    actorType: 'admin',
-    actorId: req.auth.id,
-    action: 'admin.overview.view',
-    resourceType: 'platform',
-  })
+    await audit({
+      actorType: 'admin',
+      actorId: req.auth.id,
+      action: 'admin.overview.view',
+      resourceType: 'platform',
+    })
 
-  res.json({ totalUsers, assessmentsCompleted, referralsMade, professionalsOnNetwork })
-})
+    res.json({ totalUsers, assessmentsCompleted, referralsMade, professionalsOnNetwork })
+  }
+)
 
-// The four-tier safety queue. Counts by risk level plus the most recent
-// referrals that still need professional/clinical attention.
-adminRouter.get('/safety', requireAuth, requireRole('admin'), async (req, res) => {
-  const riskCounts = await prisma.checkIn.groupBy({
-    by: ['riskLevel'],
-    _count: { riskLevel: true },
-  })
+// Safety queue: clinical data, restricted to platform admin and the
+// clinical safety reviewer role specifically — never SUPPORT.
+adminRouter.get(
+  '/safety',
+  requireAuth,
+  requireAdminRole('PLATFORM_ADMIN', 'CLINICAL_SAFETY_REVIEWER'),
+  async (req, res) => {
+    const riskCounts = await prisma.checkIn.groupBy({
+      by: ['riskLevel'],
+      _count: { riskLevel: true },
+    })
 
-  const counts = { LOW: 0, ELEVATED: 0, HIGH: 0, ACUTE: 0 }
-  riskCounts.forEach((r) => {
-    counts[r.riskLevel] = r._count.riskLevel
-  })
+    const counts = { LOW: 0, ELEVATED: 0, HIGH: 0, ACUTE: 0 }
+    riskCounts.forEach((r) => {
+      counts[r.riskLevel] = r._count.riskLevel
+    })
 
-  const recentReferrals = await prisma.referral.findMany({
-    where: { status: { in: ['PENDING', 'ESCALATED'] } },
-    include: { checkIn: true, flags: true },
-    orderBy: { createdAt: 'desc' },
-    take: 10,
-  })
+    const alerts = await prisma.safetyAlert.findMany({
+      where: { resolvedAt: null },
+      orderBy: { createdAt: 'desc' },
+      take: 20,
+    })
 
-  await audit({
-    actorType: 'admin',
-    actorId: req.auth.id,
-    action: 'admin.safety.view',
-    resourceType: 'platform',
-  })
+    await audit({
+      actorType: 'admin',
+      actorId: req.auth.id,
+      action: 'admin.safety.view',
+      resourceType: 'platform',
+    })
 
-  res.json({
-    counts,
-    alerts: recentReferrals.map((r) => ({
-      id: r.id,
-      level: r.checkIn.riskLevel,
-      note: r.reason,
-      status: r.status,
-      createdAt: r.createdAt,
-    })),
-  })
-})
+    res.json({
+      counts,
+      alerts: alerts.map((a) => ({
+        id: a.id,
+        level: a.riskLevel,
+        note: a.note,
+        userId: a.userId,
+        referralId: a.referralId,
+        createdAt: a.createdAt,
+      })),
+    })
+  }
+)
+
+adminRouter.patch(
+  '/safety/:id/resolve',
+  requireAuth,
+  requireAdminRole('PLATFORM_ADMIN', 'CLINICAL_SAFETY_REVIEWER'),
+  async (req, res) => {
+    const alert = await prisma.safetyAlert.findUnique({ where: { id: req.params.id } })
+    if (!alert) return res.status(404).json({ error: 'Alert not found.' })
+
+    const updated = await prisma.safetyAlert.update({
+      where: { id: req.params.id },
+      data: { resolvedAt: new Date() },
+    })
+
+    await audit({
+      actorType: 'admin',
+      actorId: req.auth.id,
+      action: 'safety_alert.resolve',
+      resourceType: 'safety_alert',
+      resourceId: alert.id,
+    })
+
+    res.json(updated)
+  }
+)
+
+// --- Patient list: account-support scope, not clinical scope ---
+adminRouter.get(
+  '/users',
+  requireAuth,
+  requireAdminRole('PLATFORM_ADMIN', 'SUPPORT'),
+  async (req, res) => {
+    const users = await prisma.user.findMany({
+      orderBy: { createdAt: 'desc' },
+    })
+
+    const withLatestRisk = await Promise.all(
+      users.map(async (u) => {
+        const [latestCheckIn, checkInCount] = await Promise.all([
+          prisma.checkIn.findFirst({ where: { userId: u.id }, orderBy: { completedAt: 'desc' } }),
+          prisma.checkIn.count({ where: { userId: u.id } }),
+        ])
+        // SUPPORT gets account-support fields only — the clinical risk
+        // level is deliberately withheld. Only PLATFORM_ADMIN sees both.
+        return {
+          id: u.id,
+          fullName: u.fullName,
+          email: u.email,
+          createdAt: u.createdAt,
+          checkInCount,
+          latestRiskLevel: req.auth.adminRole === 'PLATFORM_ADMIN' ? latestCheckIn?.riskLevel ?? null : null,
+        }
+      })
+    )
+
+    await audit({
+      actorType: 'admin',
+      actorId: req.auth.id,
+      action: 'admin.users.list',
+      resourceType: 'user',
+    })
+
+    res.json(withLatestRisk)
+  }
+)
+
+// --- Platform-wide appointments: account-support scope ---
+adminRouter.get(
+  '/appointments',
+  requireAuth,
+  requireAdminRole('PLATFORM_ADMIN', 'SUPPORT'),
+  async (req, res) => {
+    const appointments = await prisma.appointment.findMany({
+      include: { user: true, professional: true },
+      orderBy: { scheduledFor: 'desc' },
+      take: 100,
+    })
+
+    await audit({
+      actorType: 'admin',
+      actorId: req.auth.id,
+      action: 'admin.appointments.list',
+      resourceType: 'appointment',
+    })
+
+    res.json(
+      appointments.map((a) => ({
+        id: a.id,
+        scheduledFor: a.scheduledFor,
+        type: a.type,
+        status: a.status,
+        feeKes: a.feeKes,
+        userId: a.userId,
+        userFullName: a.user.fullName,
+        professionalId: a.professionalId,
+        professionalFullName: a.professional.fullName,
+      }))
+    )
+  }
+)
 
 // --- Professional management ---
-// Unlike the public /api/professionals directory (verified only), this
-// returns every professional regardless of verification status, since an
-// admin's whole job here is to review and verify the unverified ones.
-adminRouter.get('/professionals', requireAuth, requireRole('admin'), async (req, res) => {
-  const professionals = await prisma.professional.findMany({
-    orderBy: { createdAt: 'desc' },
-  })
+// Viewing the roster (including unverified ones) is open to the clinical
+// reviewer too. Actually verifying/unverifying is a platform-level trust
+// decision — PLATFORM_ADMIN only.
+adminRouter.get(
+  '/professionals',
+  requireAuth,
+  requireAdminRole('PLATFORM_ADMIN', 'CLINICAL_SAFETY_REVIEWER'),
+  async (req, res) => {
+    const professionals = await prisma.professional.findMany({
+      orderBy: { createdAt: 'desc' },
+    })
 
-  await audit({
-    actorType: 'admin',
-    actorId: req.auth.id,
-    action: 'admin.professionals.list',
-    resourceType: 'professional',
-  })
+    await audit({
+      actorType: 'admin',
+      actorId: req.auth.id,
+      action: 'admin.professionals.list',
+      resourceType: 'professional',
+    })
 
-  res.json(professionals)
-})
+    res.json(professionals)
+  }
+)
 
 const verifySchema = z.object({ verified: z.boolean() })
 
-adminRouter.patch('/professionals/:id/verify', requireAuth, requireRole('admin'), async (req, res) => {
-  const parsed = verifySchema.safeParse(req.body)
-  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() })
+adminRouter.patch(
+  '/professionals/:id/verify',
+  requireAuth,
+  requireAdminRole('PLATFORM_ADMIN'),
+  async (req, res) => {
+    const parsed = verifySchema.safeParse(req.body)
+    if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() })
 
-  const professional = await prisma.professional.findUnique({ where: { id: req.params.id } })
-  if (!professional) return res.status(404).json({ error: 'Professional not found.' })
+    const professional = await prisma.professional.findUnique({ where: { id: req.params.id } })
+    if (!professional) return res.status(404).json({ error: 'Professional not found.' })
 
-  const updated = await prisma.professional.update({
-    where: { id: req.params.id },
-    data: { verified: parsed.data.verified },
-  })
+    const updated = await prisma.professional.update({
+      where: { id: req.params.id },
+      data: { verified: parsed.data.verified },
+    })
 
-  await audit({
-    actorType: 'admin',
-    actorId: req.auth.id,
-    action: parsed.data.verified ? 'professional.verify' : 'professional.unverify',
-    resourceType: 'professional',
-    resourceId: professional.id,
-  })
+    await audit({
+      actorType: 'admin',
+      actorId: req.auth.id,
+      action: parsed.data.verified ? 'professional.verify' : 'professional.unverify',
+      resourceType: 'professional',
+      resourceId: professional.id,
+    })
 
-  res.json(updated)
-})
+    res.json(updated)
+  }
+)
+
+// --- Platform-wide referrals ---
+// Kept pseudonymous (no patient name/email) even for admin roles — this is
+// clinical screening data, and the "Anonymous User #xxxx" convention here
+// matches what professionals see on their own referral queue, for
+// consistency in how identity is handled around clinical content.
+adminRouter.get(
+  '/referrals',
+  requireAuth,
+  requireAdminRole('PLATFORM_ADMIN', 'CLINICAL_SAFETY_REVIEWER'),
+  async (req, res) => {
+    const referrals = await prisma.referral.findMany({
+      include: { checkIn: true, professional: true, flags: true },
+      orderBy: { createdAt: 'desc' },
+      take: 100,
+    })
+
+    await audit({
+      actorType: 'admin',
+      actorId: req.auth.id,
+      action: 'admin.referrals.list',
+      resourceType: 'referral',
+    })
+
+    res.json(
+      referrals.map((r) => ({
+        id: r.id,
+        userId: r.userId,
+        status: r.status,
+        reason: r.reason,
+        riskLevel: r.checkIn.riskLevel,
+        professionalFullName: r.professional?.fullName ?? 'Unassigned',
+        flags: r.flags.map((f) => f.label),
+        createdAt: r.createdAt,
+      }))
+    )
+  }
+)
+
+// --- Analytics ---
+// Business-sensitive — PLATFORM_ADMIN only, same tier as Institutions.
+// Built from what actually exists in the database today, not fabricated
+// trend lines — with a small real user base, honest current-state numbers
+// are more useful than invented month-over-month "growth."
+adminRouter.get(
+  '/analytics',
+  requireAuth,
+  requireAdminRole('PLATFORM_ADMIN'),
+  async (req, res) => {
+    const fourteenDaysAgo = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000)
+
+    const [
+      recentCheckIns,
+      riskCounts,
+      referralStatusCounts,
+      appointmentStatusCounts,
+      totalProfessionals,
+      verifiedProfessionals,
+    ] = await Promise.all([
+      prisma.checkIn.findMany({
+        where: { completedAt: { gte: fourteenDaysAgo } },
+        select: { completedAt: true },
+      }),
+      prisma.checkIn.groupBy({ by: ['riskLevel'], _count: { riskLevel: true } }),
+      prisma.referral.groupBy({ by: ['status'], _count: { status: true } }),
+      prisma.appointment.groupBy({ by: ['status'], _count: { status: true } }),
+      prisma.professional.count(),
+      prisma.professional.count({ where: { verified: true } }),
+    ])
+
+    // Bucket check-ins by calendar day in JS — simpler and more portable
+    // than a raw SQL date-trunc for a 14-day window at this scale.
+    const dayBuckets = {}
+    for (let i = 13; i >= 0; i--) {
+      const d = new Date(Date.now() - i * 24 * 60 * 60 * 1000)
+      const key = d.toISOString().slice(0, 10)
+      dayBuckets[key] = 0
+    }
+    recentCheckIns.forEach((c) => {
+      const key = c.completedAt.toISOString().slice(0, 10)
+      if (key in dayBuckets) dayBuckets[key] += 1
+    })
+
+    await audit({
+      actorType: 'admin',
+      actorId: req.auth.id,
+      action: 'admin.analytics.view',
+      resourceType: 'platform',
+    })
+
+    res.json({
+      checkInsByDay: Object.entries(dayBuckets).map(([date, count]) => ({ date, count })),
+      riskLevelBreakdown: riskCounts.map((r) => ({ level: r.riskLevel, count: r._count.riskLevel })),
+      referralStatusBreakdown: referralStatusCounts.map((r) => ({ status: r.status, count: r._count.status })),
+      appointmentStatusBreakdown: appointmentStatusCounts.map((r) => ({ status: r.status, count: r._count.status })),
+      professionals: { total: totalProfessionals, verified: verifiedProfessionals },
+    })
+  }
+)

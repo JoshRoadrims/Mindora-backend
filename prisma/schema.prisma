@@ -65,6 +65,33 @@ enum AdminRole {
   SUPPORT
 }
 
+enum DocumentType {
+  LICENSE
+  GOVERNMENT_ID
+  DEGREE_CERTIFICATE
+  OTHER
+}
+
+enum DocumentStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum InstitutionType {
+  EMPLOYER
+  UNIVERSITY
+  HEALTHCARE_PROVIDER
+  INSURER
+  OTHER
+}
+
+enum InstitutionStatus {
+  PENDING
+  ACTIVE
+  INACTIVE
+}
+
 // ---------------------------------------------------------------------------
 // Identity
 // ---------------------------------------------------------------------------
@@ -86,28 +113,31 @@ model User {
 }
 
 model Professional {
-  id              String            @id @default(uuid())
-  email           String            @unique
-  passwordHash    String
-  fullName        String
-  type            ProfessionalType
-  bio             String?
-  qualifications  String[]
-  focusAreas      String[]
-  languages       String[]
-  yearsExperience Int               @default(0)
-  location        String?
-  feeKes          Int?
-  onlineAvailable Boolean           @default(true)
-  inPersonAvailable Boolean         @default(false)
-  verified        Boolean           @default(false)
-  createdAt       DateTime          @default(now())
-  updatedAt       DateTime          @updatedAt
+  id                  String            @id @default(uuid())
+  email               String            @unique
+  passwordHash        String
+  fullName            String
+  type                ProfessionalType
+  bio                 String?
+  qualifications      String[]
+  focusAreas          String[]
+  languages           String[]
+  yearsExperience     Int               @default(0)
+  location            String?
+  feeKes              Int?
+  onlineAvailable     Boolean           @default(true)
+  inPersonAvailable   Boolean           @default(false)
+  verified            Boolean           @default(false)
+  agreementAcceptedAt DateTime?
+  agreementVersion    String?
+  createdAt           DateTime          @default(now())
+  updatedAt           DateTime          @updatedAt
 
   referrals       Referral[]
   appointments    Appointment[]
   clinicalNotes   ClinicalNote[]
   auditLogs       AuditLog[]
+  documents       ProfessionalDocument[]
 
   @@map("professionals")
 }
@@ -201,6 +231,7 @@ model Appointment {
   type           AppointmentType
   status         AppointmentStatus @default(SCHEDULED)
   feeKes         Int
+  meetingUrl     String?
   createdAt      DateTime          @default(now())
 
   @@index([professionalId, scheduledFor])
@@ -224,6 +255,25 @@ model ClinicalNote {
   @@map("clinical_notes")
 }
 
+// KYC / credential documents. Files themselves live on disk (see
+// document.routes.js for the current local-disk approach and its caveats);
+// this table only holds metadata plus the review outcome.
+model ProfessionalDocument {
+  id             String         @id @default(uuid())
+  professionalId String
+  professional   Professional   @relation(fields: [professionalId], references: [id], onDelete: Cascade)
+  type           DocumentType
+  fileName       String
+  filePath       String
+  status         DocumentStatus @default(PENDING)
+  reviewNotes    String?
+  reviewedAt     DateTime?
+  uploadedAt     DateTime       @default(now())
+
+  @@index([professionalId])
+  @@map("professional_documents")
+}
+
 // ---------------------------------------------------------------------------
 // Safety / escalation
 // ---------------------------------------------------------------------------
@@ -239,6 +289,28 @@ model SafetyAlert {
 
   @@index([riskLevel, resolvedAt])
   @@map("safety_alerts")
+}
+
+// ---------------------------------------------------------------------------
+// Institutional partners — employers, universities, healthcare providers,
+// insurers. A lightweight CRM-style list for now (no user<->institution
+// linkage yet); that relationship is a real product decision for once
+// Mindora actually has an institutional pilot to design against, not
+// something to guess at prematurely.
+// ---------------------------------------------------------------------------
+
+model Institution {
+  id           String             @id @default(uuid())
+  name         String
+  type         InstitutionType
+  contactName  String?
+  contactEmail String?
+  status       InstitutionStatus  @default(PENDING)
+  notes        String?
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+
+  @@map("institutions")
 }
 
 // ---------------------------------------------------------------------------
