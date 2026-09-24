@@ -265,6 +265,7 @@ adminRouter.get(
       appointmentStatusCounts,
       totalProfessionals,
       verifiedProfessionals,
+      allAppointments,
     ] = await Promise.all([
       prisma.checkIn.findMany({
         where: { completedAt: { gte: fourteenDaysAgo } },
@@ -275,6 +276,14 @@ adminRouter.get(
       prisma.appointment.groupBy({ by: ['status'], _count: { status: true } }),
       prisma.professional.count(),
       prisma.professional.count({ where: { verified: true } }),
+      // Pulled once, broken down in JS below — a booking's "tier" isn't a
+      // stored column, it's derived from whether an institution sponsored
+      // it and how much: 100% covered reads as the corporate/EAP tier,
+      // partially covered reads as the student/discount tier, and anything
+      // with no institution at all is the standard self-pay tier.
+      prisma.appointment.findMany({
+        select: { feeKes: true, institutionCoveredKes: true, sponsoringInstitutionId: true },
+      }),
     ])
 
     const dayBuckets = {}
@@ -287,6 +296,21 @@ adminRouter.get(
       const key = c.completedAt.toISOString().slice(0, 10)
       if (key in dayBuckets) dayBuckets[key] += 1
     })
+
+    const tierBreakdown = { standard: { count: 0, revenueKes: 0 }, student: { count: 0, revenueKes: 0 }, corporate: { count: 0, revenueKes: 0 } }
+    for (const a of allAppointments) {
+      const patientPaysKes = a.feeKes - a.institutionCoveredKes
+      if (!a.sponsoringInstitutionId) {
+        tierBreakdown.standard.count += 1
+        tierBreakdown.standard.revenueKes += patientPaysKes
+      } else if (a.institutionCoveredKes >= a.feeKes && a.feeKes > 0) {
+        tierBreakdown.corporate.count += 1
+        tierBreakdown.corporate.revenueKes += patientPaysKes
+      } else {
+        tierBreakdown.student.count += 1
+        tierBreakdown.student.revenueKes += patientPaysKes
+      }
+    }
 
     await audit({
       actorType: 'admin',
@@ -301,6 +325,7 @@ adminRouter.get(
       referralStatusBreakdown: referralStatusCounts.map((r) => ({ status: r.status, count: r._count.status })),
       appointmentStatusBreakdown: appointmentStatusCounts.map((r) => ({ status: r.status, count: r._count.status })),
       professionals: { total: totalProfessionals, verified: verifiedProfessionals },
+      tierBreakdown,
     })
   }
 )

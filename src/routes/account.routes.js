@@ -111,3 +111,52 @@ accountRouter.get('/export', requireAuth, requireRole('user', 'professional'), a
 
   res.json({ exportedAt: new Date().toISOString(), data })
 })
+
+const enrollSchema = z.object({ enrollmentCode: z.string().min(1) })
+
+// A patient links their own account to a sponsoring institution using a
+// code the institution shares with them — self-service, no admin approval
+// needed per-enrollment (the institution's own ACTIVE status is the gate).
+accountRouter.post('/enroll', requireAuth, requireRole('user'), async (req, res) => {
+  const parsed = enrollSchema.safeParse(req.body)
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() })
+
+  const institution = await prisma.institution.findUnique({
+    where: { enrollmentCode: parsed.data.enrollmentCode.toUpperCase() },
+  })
+
+  if (!institution || institution.status !== 'ACTIVE') {
+    return res.status(404).json({ error: 'Invalid or inactive enrollment code.' })
+  }
+
+  await prisma.user.update({ where: { id: req.auth.id }, data: { institutionId: institution.id } })
+
+  await audit({
+    actorType: 'user',
+    actorId: req.auth.id,
+    action: 'account.institution_enroll',
+    resourceType: 'institution',
+    resourceId: institution.id,
+  })
+
+  res.json({ name: institution.name, type: institution.type, coveragePercent: institution.coveragePercent })
+})
+
+// What the patient sees about their own linked institution — never the
+// enrollment code itself (that's for re-sharing by the institution, not
+// re-display to an already-linked member).
+accountRouter.get('/institution', requireAuth, requireRole('user'), async (req, res) => {
+  const user = await prisma.user.findUnique({
+    where: { id: req.auth.id },
+    include: { institution: true },
+  })
+
+  if (!user?.institution) return res.json(null)
+
+  res.json({
+    name: user.institution.name,
+    type: user.institution.type,
+    coveragePercent: user.institution.coveragePercent,
+    status: user.institution.status,
+  })
+})

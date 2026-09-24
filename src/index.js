@@ -16,6 +16,9 @@ import { documentRouter } from './routes/document.routes.js'
 import { institutionRouter } from './routes/institution.routes.js'
 import { aiRouter } from './routes/ai.routes.js'
 import { accountRouter } from './routes/account.routes.js'
+import { startAppointmentReminderJob } from './jobs/appointmentReminders.js'
+import { reviewRouter } from './routes/review.routes.js'
+import { messageRouter } from './routes/message.routes.js'
 
 const app = express()
 
@@ -39,6 +42,8 @@ app.use('/api/documents', documentRouter)
 app.use('/api/institutions', institutionRouter)
 app.use('/api/ai', aiRouter)
 app.use('/api/account', accountRouter)
+app.use('/api/reviews', reviewRouter)
+app.use('/api/messages', messageRouter)
 
 // Centralised error handler — keeps stack traces out of prod responses.
 app.use((err, _req, res, _next) => {
@@ -51,4 +56,5 @@ app.use((err, _req, res, _next) => {
 const port = process.env.PORT || 4000
 app.listen(port, () => {
   console.log(`Mindora API listening on http://localhost:${port} [${process.env.NODE_ENV}]`)
+  startAppointmentReminderJob()
 })

@@ -47,11 +47,20 @@ function computeRisk(answers) {
     if (selfHarmAnswer.value >= 3) bumpTo('ACUTE')
     else if (selfHarmAnswer.value >= 1) bumpTo('HIGH')
   }
+
+  // Tracks whether it was specifically the substance-use answer that
+  // drove this result, so the frontend can show substance-specific
+  // guidance (NACADA's helpline) rather than only generic messaging —
+  // without this flag, a severe substance-use answer that happened to
+  // coincide with an already-high overall score would be
+  // indistinguishable from one that pushed the tier up on its own.
+  let substanceFlag = false
   if (substanceAnswer?.value >= 3) {
     bumpTo('ELEVATED')
+    substanceFlag = true
   }
 
-  return { totalScore, maxScore, riskLevel }
+  return { totalScore, maxScore, riskLevel, substanceFlag }
 }
 
 checkInRouter.post('/', requireAuth, requireRole('user'), async (req, res) => {
@@ -59,7 +68,7 @@ checkInRouter.post('/', requireAuth, requireRole('user'), async (req, res) => {
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() })
 
   const { answers } = parsed.data
-  const { totalScore, maxScore, riskLevel } = computeRisk(answers)
+  const { totalScore, maxScore, riskLevel, substanceFlag } = computeRisk(answers)
 
   const checkIn = await prisma.checkIn.create({
     data: {
@@ -89,8 +98,10 @@ checkInRouter.post('/', requireAuth, requireRole('user'), async (req, res) => {
         checkInId: checkIn.id,
         professionalId: professional?.id,
         status: 'PENDING',
-        reason:
-          'Screening responses indicate that professional assessment may be beneficial.',
+        reason: substanceFlag
+          ? 'Screening responses indicate a concern related to alcohol or drug use that may benefit from professional support.'
+          : 'Screening responses indicate that professional assessment may be beneficial.',
+        flags: substanceFlag ? { create: [{ label: 'Substance use concern' }] } : undefined,
       },
     })
   }
@@ -117,7 +128,7 @@ checkInRouter.post('/', requireAuth, requireRole('user'), async (req, res) => {
     action: 'check_in.submit',
     resourceType: 'check_in',
     resourceId: checkIn.id,
-    metadata: { riskLevel },
+    metadata: { riskLevel, substanceFlag },
   })
 
   res.status(201).json({
@@ -126,6 +137,7 @@ checkInRouter.post('/', requireAuth, requireRole('user'), async (req, res) => {
     totalScore: checkIn.totalScore,
     maxScore: checkIn.maxScore,
     referralId: referral?.id ?? null,
+    substanceFlag,
   })
 })
 

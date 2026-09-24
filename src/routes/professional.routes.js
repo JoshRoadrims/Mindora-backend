@@ -1,4 +1,5 @@
 import { Router } from 'express'
+import { z } from 'zod'
 import { prisma } from '../lib/prisma.js'
 import { requireAuth, requireRole } from '../middleware/auth.js'
 import { audit } from '../lib/audit.js'
@@ -63,6 +64,73 @@ professionalRouter.post(
     })
   }
 )
+
+// --- Self-profile view/edit ---
+// '/me/profile' is a two-segment path, so it never conflicts with the
+// single-segment '/:id' route below regardless of declaration order.
+
+const updateProfileSchema = z.object({
+  bio: z.string().max(2000).optional(),
+  qualifications: z.array(z.string()).optional(),
+  focusAreas: z.array(z.string()).optional(),
+  languages: z.array(z.string()).optional(),
+  yearsExperience: z.number().int().min(0).max(70).optional(),
+  location: z.string().optional(),
+  feeKes: z.number().int().min(0).optional(),
+  onlineAvailable: z.boolean().optional(),
+  inPersonAvailable: z.boolean().optional(),
+})
+
+// A professional's own full profile — unlike the public directory (which
+// only ever shows verified professionals), this returns their own record
+// regardless of verification status, since they need to see and edit it
+// before they're approved.
+professionalRouter.get('/me/profile', requireAuth, requireRole('professional'), async (req, res) => {
+  const professional = await prisma.professional.findUnique({ where: { id: req.auth.id } })
+  if (!professional) return res.status(401).json({ error: 'Authentication required.' })
+  res.json(professional)
+})
+
+professionalRouter.patch('/me/profile', requireAuth, requireRole('professional'), async (req, res) => {
+  const parsed = updateProfileSchema.safeParse(req.body)
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() })
+
+  const current = await prisma.professional.findUnique({ where: { id: req.auth.id } })
+  if (!current) return res.status(401).json({ error: 'Authentication required.' })
+
+  // Qualifications is the one field the "Verified by Mindora" badge is
+  // actually vouching for — it's what the reviewed KYC documents (degree
+  // certificate, license) substantiate. Changing it after verification
+  // without re-review would let a claim go unchecked while the verified
+  // badge kept showing, so any real change here automatically un-verifies
+  // the account until admin reviews it again.
+  const data = { ...parsed.data }
+  let credentialsChanged = false
+
+  if (parsed.data.qualifications) {
+    const changed =
+      JSON.stringify(parsed.data.qualifications) !== JSON.stringify(current.qualifications)
+    if (changed && current.verified) {
+      data.verified = false
+      credentialsChanged = true
+    }
+  }
+
+  const updated = await prisma.professional.update({
+    where: { id: req.auth.id },
+    data,
+  })
+
+  await audit({
+    actorType: 'professional',
+    actorId: req.auth.id,
+    action: credentialsChanged ? 'professional.credentials_changed' : 'professional.profile_update',
+    resourceType: 'professional',
+    resourceId: req.auth.id,
+  })
+
+  res.json(updated)
+})
 
 professionalRouter.get('/:id', requireAuth, async (req, res) => {
   const professional = await prisma.professional.findUnique({

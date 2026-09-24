@@ -6,6 +6,14 @@ import { audit } from '../lib/audit.js'
 
 export const appointmentRouter = Router()
 
+// Fixed session length — matches the industry-standard "60 min" sessions
+// seen across comparable Kenyan platforms. A real per-professional
+// availability calendar (with configurable slot lengths) is the natural
+// next step beyond this; this is the minimum fix for the actual bug:
+// nothing currently stops two patients booking the same professional at
+// the same time.
+const SESSION_DURATION_MINUTES = 60
+
 const bookSchema = z.object({
   professionalId: z.string().uuid(),
   scheduledFor: z.string().datetime(),
@@ -19,19 +27,63 @@ appointmentRouter.post('/', requireAuth, requireRole('user'), async (req, res) =
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() })
 
   const { professionalId, scheduledFor, type } = parsed.data
+  const requestedTime = new Date(scheduledFor)
+
+  if (requestedTime < new Date()) {
+    return res.status(400).json({ error: 'Appointment time must be in the future.' })
+  }
 
   const professional = await prisma.professional.findUnique({ where: { id: professionalId } })
   if (!professional || !professional.verified) {
     return res.status(404).json({ error: 'Professional not found.' })
   }
 
+  // Conflict check: with a fixed session length, two appointments for the
+  // same professional overlap whenever their start times fall within one
+  // session length of each other. Cancelled appointments free up the slot.
+  const windowStart = new Date(requestedTime.getTime() - SESSION_DURATION_MINUTES * 60 * 1000)
+  const windowEnd = new Date(requestedTime.getTime() + SESSION_DURATION_MINUTES * 60 * 1000)
+
+  const conflict = await prisma.appointment.findFirst({
+    where: {
+      professionalId,
+      status: { not: 'CANCELLED' },
+      scheduledFor: { gt: windowStart, lt: windowEnd },
+    },
+  })
+
+  if (conflict) {
+    return res.status(409).json({
+      error: 'This professional already has an appointment around that time. Please choose a different slot.',
+    })
+  }
+
+  const fullFee = professional.feeKes ?? 0
+
+  // If the patient is linked to an ACTIVE institution, that institution
+  // covers coveragePercent% of the fee (capped at the full fee) — this is
+  // the corporate EAP / student-discount mechanism.
+  const user = await prisma.user.findUnique({ where: { id: req.auth.id }, include: { institution: true } })
+  let sponsoringInstitutionId = null
+  let institutionCoveredKes = 0
+
+  if (user?.institution && user.institution.status === 'ACTIVE' && user.institution.coveragePercent > 0) {
+    sponsoringInstitutionId = user.institution.id
+    institutionCoveredKes = Math.min(
+      fullFee,
+      Math.round((fullFee * user.institution.coveragePercent) / 100)
+    )
+  }
+
   const appointment = await prisma.appointment.create({
     data: {
       userId: req.auth.id,
       professionalId,
-      scheduledFor: new Date(scheduledFor),
+      scheduledFor: requestedTime,
       type,
-      feeKes: professional.feeKes ?? 0,
+      feeKes: fullFee,
+      sponsoringInstitutionId,
+      institutionCoveredKes,
     },
   })
 
@@ -49,6 +101,7 @@ appointmentRouter.post('/', requireAuth, requireRole('user'), async (req, res) =
     action: 'appointment.book',
     resourceType: 'appointment',
     resourceId: appointment.id,
+    metadata: sponsoringInstitutionId ? { institutionCoveredKes } : undefined,
   })
 
   res.status(201).json(finalAppointment)

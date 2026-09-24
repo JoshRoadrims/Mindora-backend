@@ -109,6 +109,8 @@ model User {
   fullName          String
   consentAcceptedAt DateTime?
   consentVersion    String?
+  institutionId     String?
+  institution       Institution? @relation(fields: [institutionId], references: [id], onDelete: SetNull)
   createdAt         DateTime  @default(now())
   updatedAt         DateTime  @updatedAt
 
@@ -116,6 +118,8 @@ model User {
   referrals     Referral[]
   appointments  Appointment[]
   auditLogs     AuditLog[]
+  reviews       Review[]
+  sentMessages  Message[] @relation("MessagesSentByUser")
 
   @@map("users")
 }
@@ -129,7 +133,7 @@ model Professional {
   bio                 String?
   qualifications      String[]
   focusAreas          String[]
-  languages           String[]
+  languages            String[]
   yearsExperience     Int               @default(0)
   location            String?
   feeKes              Int?
@@ -146,6 +150,8 @@ model Professional {
   clinicalNotes   ClinicalNote[]
   auditLogs       AuditLog[]
   documents       ProfessionalDocument[]
+  reviews         Review[]
+  sentMessages    Message[] @relation("MessagesSentByProfessional")
 
   @@map("professionals")
 }
@@ -227,30 +233,29 @@ model ReferralFlag {
 }
 
 model Appointment {
-  id             String            @id @default(uuid())
-  userId         String
-  user           User              @relation(fields: [userId], references: [id], onDelete: Cascade)
-  professionalId String
-  professional   Professional      @relation(fields: [professionalId], references: [id], onDelete: Cascade)
-  scheduledFor   DateTime
-  type           AppointmentType
-  status         AppointmentStatus @default(SCHEDULED)
-  feeKes         Int
-  meetingUrl     String?
-  createdAt      DateTime          @default(now())
+  id                      String            @id @default(uuid())
+  userId                  String
+  user                    User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  professionalId          String
+  professional            Professional      @relation(fields: [professionalId], references: [id], onDelete: Cascade)
+  scheduledFor            DateTime
+  type                    AppointmentType
+  status                  AppointmentStatus @default(SCHEDULED)
+  feeKes                  Int
+  meetingUrl              String?
+  sponsoringInstitutionId String?
+  sponsoringInstitution   Institution?      @relation(fields: [sponsoringInstitutionId], references: [id], onDelete: SetNull)
+  institutionCoveredKes   Int               @default(0)
+  reminderSentAt          DateTime?
+  createdAt               DateTime          @default(now())
+
+  review                  Review?
 
   @@index([professionalId, scheduledFor])
   @@index([userId, scheduledFor])
   @@map("appointments")
 }
 
-// Clinical notes deliberately have no foreign-key relation on userId (it's
-// a plain reference, not an enforced FK). This is intentional: if the
-// patient's User row is later deleted (see AccountDeletionRequest below),
-// the note is NOT cascade-deleted along with it — a professional's own
-// clinical documentation may carry separate retention obligations, and
-// once the User row is gone, a bare userId with no name/email attached is
-// already substantially de-identified.
 model ClinicalNote {
   id             String       @id @default(uuid())
   professionalId String
@@ -281,6 +286,51 @@ model ProfessionalDocument {
 }
 
 // ---------------------------------------------------------------------------
+// Reviews
+// ---------------------------------------------------------------------------
+
+model Review {
+  id             String       @id @default(uuid())
+  userId         String?
+  user           User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
+  professionalId String
+  professional   Professional @relation(fields: [professionalId], references: [id], onDelete: Cascade)
+  appointmentId  String       @unique
+  appointment    Appointment  @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+  rating         Int
+  comment        String?
+  createdAt      DateTime     @default(now())
+
+  @@index([professionalId])
+  @@map("reviews")
+}
+
+// ---------------------------------------------------------------------------
+// Messages — patient <-> professional, restricted to pairs who have (or
+// had) a real booked appointment together. senderRole disambiguates which
+// side sent it, since either a userId or a professionalId is set on the
+// sender side depending on who sent it, never both. This exists so
+// patients and professionals never need to exchange real contact info to
+// communicate outside a scheduled call — the original goal behind
+// building this at all.
+// ---------------------------------------------------------------------------
+
+model Message {
+  id               String        @id @default(uuid())
+  userId           String
+  user             User          @relation("MessagesSentByUser", fields: [userId], references: [id], onDelete: Cascade)
+  professionalId   String
+  professional     Professional  @relation("MessagesSentByProfessional", fields: [professionalId], references: [id], onDelete: Cascade)
+  senderRole       String        // "user" | "professional" — who actually sent this message
+  content          String
+  readAt           DateTime?
+  createdAt        DateTime      @default(now())
+
+  @@index([userId, professionalId, createdAt])
+  @@map("messages")
+}
+
+// ---------------------------------------------------------------------------
 // Safety / escalation
 // ---------------------------------------------------------------------------
 
@@ -302,15 +352,20 @@ model SafetyAlert {
 // ---------------------------------------------------------------------------
 
 model Institution {
-  id           String             @id @default(uuid())
-  name         String
-  type         InstitutionType
-  contactName  String?
-  contactEmail String?
-  status       InstitutionStatus  @default(PENDING)
-  notes        String?
-  createdAt    DateTime           @default(now())
-  updatedAt    DateTime           @updatedAt
+  id                     String             @id @default(uuid())
+  name                   String
+  type                   InstitutionType
+  contactName            String?
+  contactEmail           String?
+  status                 InstitutionStatus  @default(PENDING)
+  notes                  String?
+  coveragePercent        Int                @default(0)
+  enrollmentCode         String             @unique
+  createdAt              DateTime           @default(now())
+  updatedAt              DateTime           @updatedAt
+
+  members                User[]
+  sponsoredAppointments  Appointment[]
 
   @@map("institutions")
 }
@@ -350,16 +405,12 @@ model RefreshToken {
 }
 
 // ---------------------------------------------------------------------------
-// Account deletion requests — a review queue, not instant self-service
-// hard-delete. See the ClinicalNote comment above for why: some data may
-// need to survive a deletion request for a professional's own record-
-// keeping duties, so a human (PLATFORM_ADMIN) reviews and processes each
-// request deliberately rather than the system auto-purging everything.
+// Account deletion requests
 // ---------------------------------------------------------------------------
 
 model AccountDeletionRequest {
   id               String                 @id @default(uuid())
-  role             String                 // "user" | "professional"
+  role             String
   accountId        String
   email            String
   reason           String?
@@ -373,9 +424,7 @@ model AccountDeletionRequest {
 }
 
 // ---------------------------------------------------------------------------
-// Audit logging — user/professional/admin relations use SetNull on delete
-// so the audit trail itself survives account deletion, rather than being
-// silently wiped or blocking the deletion entirely.
+// Audit logging
 // ---------------------------------------------------------------------------
 
 model AuditLog {
