@@ -7,17 +7,17 @@ async function main() {
   const passwordHash = await bcrypt.hash('demo-password', 12)
 
   const user = await prisma.user.upsert({
-    where: { email: 'joshua@example.com' },
+    where: { email: 'kilwanda.josh@roadrimz.com' },
     update: {},
-    create: { fullName: 'Joshua Otieno', email: 'joshua@example.com', passwordHash },
+    create: { fullName: 'Joshua Otieno', email: 'kilwanda.josh@roadrimz.com', passwordHash },
   })
 
   const professional = await prisma.professional.upsert({
-    where: { email: 'sarah.mwangi@example.com' },
+    where: { email: 'kilwanda.josh@roadrimz.com' },
     update: { verified: true },
     create: {
       fullName: 'Dr. Sarah Mwangi',
-      email: 'sarah.mwangi@example.com',
+      email: 'kilwanda.josh@roadrimz.com',
       passwordHash,
       type: 'CLINICAL_PSYCHOLOGIST',
       bio: 'Clinical psychologist with 9 years of experience supporting young adults through anxiety, depression, and major life transitions.',
@@ -34,11 +34,11 @@ async function main() {
   })
 
   const platformAdmin = await prisma.admin.upsert({
-    where: { email: 'admin@mindora.local' },
+    where: { email: 'kilwanda.josh@roadrimz.com' },
     update: { role: 'PLATFORM_ADMIN' },
     create: {
       fullName: 'Mindora Platform Team',
-      email: 'admin@mindora.local',
+      email: 'kilwanda.josh@roadrimz.com',
       passwordHash,
       role: 'PLATFORM_ADMIN',
     },

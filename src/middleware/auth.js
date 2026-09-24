@@ -1,4 +1,4 @@
-import { verifyToken } from '../lib/auth.js'
+import { verifyAccessToken } from '../lib/auth.js'
 import { prisma } from '../lib/prisma.js'
 import { CURRENT_AGREEMENT_VERSION } from '../lib/agreement.js'
 
@@ -7,7 +7,7 @@ export function attachAuth(req, _res, next) {
   const header = req.headers.authorization
   if (header?.startsWith('Bearer ')) {
     try {
-      const payload = verifyToken(header.slice(7))
+      const payload = verifyAccessToken(header.slice(7))
       req.auth = { id: payload.sub, role: payload.role, adminRole: payload.adminRole }
     } catch {
       // invalid/expired token — leave req.auth undefined

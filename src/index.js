@@ -4,6 +4,7 @@ import cors from 'cors'
 import helmet from 'helmet'
 import morgan from 'morgan'
 import { attachAuth } from './middleware/auth.js'
+import { apiLimiter } from './middleware/rateLimit.js'
 import { authRouter } from './routes/auth.routes.js'
 import { referralRouter } from './routes/referral.routes.js'
 import { checkInRouter } from './routes/checkin.routes.js'
@@ -14,6 +15,7 @@ import { clientRouter } from './routes/client.routes.js'
 import { documentRouter } from './routes/document.routes.js'
 import { institutionRouter } from './routes/institution.routes.js'
 import { aiRouter } from './routes/ai.routes.js'
+import { accountRouter } from './routes/account.routes.js'
 
 const app = express()
 
@@ -22,6 +24,7 @@ app.use(cors({ origin: process.env.CORS_ORIGIN || 'http://localhost:5173', crede
 app.use(express.json())
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'))
 app.use(attachAuth)
+app.use('/api', apiLimiter)
 
 app.get('/health', (_req, res) => res.json({ status: 'ok', env: process.env.NODE_ENV }))
 
@@ -35,6 +38,7 @@ app.use('/api/clients', clientRouter)
 app.use('/api/documents', documentRouter)
 app.use('/api/institutions', institutionRouter)
 app.use('/api/ai', aiRouter)
+app.use('/api/account', accountRouter)
 
 // Centralised error handler — keeps stack traces out of prod responses.
 app.use((err, _req, res, _next) => {

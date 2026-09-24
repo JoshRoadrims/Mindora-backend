@@ -92,17 +92,25 @@ enum InstitutionStatus {
   INACTIVE
 }
 
+enum DeletionRequestStatus {
+  PENDING
+  COMPLETED
+  REJECTED
+}
+
 // ---------------------------------------------------------------------------
 // Identity
 // ---------------------------------------------------------------------------
 
 model User {
-  id            String   @id @default(uuid())
-  email         String   @unique
-  passwordHash  String
-  fullName      String
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+  id                String    @id @default(uuid())
+  email             String    @unique
+  passwordHash      String
+  fullName          String
+  consentAcceptedAt DateTime?
+  consentVersion    String?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
 
   checkIns      CheckIn[]
   referrals     Referral[]
@@ -159,9 +167,6 @@ model Admin {
 // Screening & wellbeing
 // ---------------------------------------------------------------------------
 
-// One completed check-in. Raw per-question answers live in CheckInAnswer so
-// the aggregate score can be read/displayed without touching granular
-// responses unless specifically needed (e.g. professional review).
 model CheckIn {
   id         String    @id @default(uuid())
   userId     String
@@ -182,9 +187,9 @@ model CheckInAnswer {
   id         String   @id @default(uuid())
   checkInId  String
   checkIn    CheckIn  @relation(fields: [checkInId], references: [id], onDelete: Cascade)
-  domain     String   // e.g. "mood", "sleep", "anxiety"
+  domain     String
   questionId String
-  value      Int      // 0-3, per PHQ/GAD-style response scale
+  value      Int
 
   @@map("check_in_answers")
 }
@@ -200,7 +205,7 @@ model Referral {
   checkInId      String         @unique
   checkIn        CheckIn        @relation(fields: [checkInId], references: [id], onDelete: Cascade)
   professionalId String?
-  professional   Professional?  @relation(fields: [professionalId], references: [id])
+  professional   Professional?  @relation(fields: [professionalId], references: [id], onDelete: SetNull)
   status         ReferralStatus @default(PENDING)
   reason         String
   createdAt      DateTime       @default(now())
@@ -239,9 +244,13 @@ model Appointment {
   @@map("appointments")
 }
 
-// Clinical notes are the most sensitive table in the schema after raw
-// check-in answers. Access must always be scoped to the authoring
-// professional (or an authorised clinical reviewer) at the application layer.
+// Clinical notes deliberately have no foreign-key relation on userId (it's
+// a plain reference, not an enforced FK). This is intentional: if the
+// patient's User row is later deleted (see AccountDeletionRequest below),
+// the note is NOT cascade-deleted along with it — a professional's own
+// clinical documentation may carry separate retention obligations, and
+// once the User row is gone, a bare userId with no name/email attached is
+// already substantially de-identified.
 model ClinicalNote {
   id             String       @id @default(uuid())
   professionalId String
@@ -255,9 +264,6 @@ model ClinicalNote {
   @@map("clinical_notes")
 }
 
-// KYC / credential documents. Files themselves live on disk (see
-// document.routes.js for the current local-disk approach and its caveats);
-// this table only holds metadata plus the review outcome.
 model ProfessionalDocument {
   id             String         @id @default(uuid())
   professionalId String
@@ -292,11 +298,7 @@ model SafetyAlert {
 }
 
 // ---------------------------------------------------------------------------
-// Institutional partners — employers, universities, healthcare providers,
-// insurers. A lightweight CRM-style list for now (no user<->institution
-// linkage yet); that relationship is a real product decision for once
-// Mindora actually has an institutional pilot to design against, not
-// something to guess at prematurely.
+// Institutional partners
 // ---------------------------------------------------------------------------
 
 model Institution {
@@ -314,20 +316,78 @@ model Institution {
 }
 
 // ---------------------------------------------------------------------------
-// Audit logging — who accessed/changed what, and when.
-// Non-negotiable for a system holding mental-health data.
+// Login OTP
+// ---------------------------------------------------------------------------
+
+model LoginOtp {
+  id         String    @id @default(uuid())
+  email      String
+  role       String
+  codeHash   String
+  expiresAt  DateTime
+  consumedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([email, role])
+  @@map("login_otps")
+}
+
+// ---------------------------------------------------------------------------
+// Refresh tokens
+// ---------------------------------------------------------------------------
+
+model RefreshToken {
+  id         String    @id @default(uuid())
+  tokenHash  String    @unique
+  role       String
+  accountId  String
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([accountId, role])
+  @@map("refresh_tokens")
+}
+
+// ---------------------------------------------------------------------------
+// Account deletion requests — a review queue, not instant self-service
+// hard-delete. See the ClinicalNote comment above for why: some data may
+// need to survive a deletion request for a professional's own record-
+// keeping duties, so a human (PLATFORM_ADMIN) reviews and processes each
+// request deliberately rather than the system auto-purging everything.
+// ---------------------------------------------------------------------------
+
+model AccountDeletionRequest {
+  id               String                 @id @default(uuid())
+  role             String                 // "user" | "professional"
+  accountId        String
+  email            String
+  reason           String?
+  status           DeletionRequestStatus  @default(PENDING)
+  requestedAt      DateTime               @default(now())
+  processedAt      DateTime?
+  processedByEmail String?
+
+  @@index([role, accountId])
+  @@map("account_deletion_requests")
+}
+
+// ---------------------------------------------------------------------------
+// Audit logging — user/professional/admin relations use SetNull on delete
+// so the audit trail itself survives account deletion, rather than being
+// silently wiped or blocking the deletion entirely.
 // ---------------------------------------------------------------------------
 
 model AuditLog {
   id             String        @id @default(uuid())
-  actorType      String        // "user" | "professional" | "admin" | "system"
+  actorType      String
   userId         String?
-  user           User?         @relation(fields: [userId], references: [id])
+  user           User?         @relation(fields: [userId], references: [id], onDelete: SetNull)
   professionalId String?
-  professional   Professional? @relation(fields: [professionalId], references: [id])
+  professional   Professional? @relation(fields: [professionalId], references: [id], onDelete: SetNull)
   adminId        String?
-  admin          Admin?        @relation(fields: [adminId], references: [id])
-  action         String        // e.g. "referral.view", "clinical_note.create"
+  admin          Admin?        @relation(fields: [adminId], references: [id], onDelete: SetNull)
+  action         String
   resourceType   String
   resourceId     String?
   metadata       Json?

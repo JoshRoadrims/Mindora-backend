@@ -1,7 +1,13 @@
 import { Router } from 'express'
 import { z } from 'zod'
 import { prisma } from '../lib/prisma.js'
-import { hashPassword, verifyPassword, signToken } from '../lib/auth.js'
+import { hashPassword, verifyPassword } from '../lib/auth.js'
+import { issueSession, refreshSession, revokeRefreshToken, revokeAllSessions } from '../lib/session.js'
+import { loginLimiter, registerLimiter, otpVerifyLimiter } from '../middleware/rateLimit.js'
+import { generateOtpCode, hashOtpCode, otpExpiryDate } from '../lib/otp.js'
+import { sendOtpEmail } from '../lib/email.js'
+import { requireAuth } from '../middleware/auth.js'
+import { CURRENT_CONSENT_VERSION } from '../lib/consent.js'
 
 export const authRouter = Router()
 
@@ -11,15 +17,36 @@ const registerSchema = z.object({
   password: z.string().min(8),
 })
 
+// Patients must explicitly consent — z.literal(true) rejects anything but
+// an actual, deliberate "true" (missing, false, or omitted all fail).
+const userRegisterSchema = registerSchema.extend({
+  consent: z.literal(true, {
+    errorMap: () => ({ message: 'You must accept the privacy consent to create an account.' }),
+  }),
+})
+
 const loginSchema = z.object({
   email: z.string().email(),
   password: z.string().min(1),
 })
 
+async function issueOtp(email, role) {
+  const code = generateOtpCode()
+  await prisma.loginOtp.create({
+    data: {
+      email,
+      role,
+      codeHash: hashOtpCode(code),
+      expiresAt: otpExpiryDate(),
+    },
+  })
+  await sendOtpEmail(email, code)
+}
+
 // --- User ---
 
-authRouter.post('/user/register', async (req, res) => {
-  const parsed = registerSchema.safeParse(req.body)
+authRouter.post('/user/register', registerLimiter, async (req, res) => {
+  const parsed = userRegisterSchema.safeParse(req.body)
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() })
 
   const { fullName, email, password } = parsed.data
@@ -27,14 +54,20 @@ authRouter.post('/user/register', async (req, res) => {
   if (existing) return res.status(409).json({ error: 'An account with this email already exists.' })
 
   const user = await prisma.user.create({
-    data: { fullName, email, passwordHash: await hashPassword(password) },
+    data: {
+      fullName,
+      email,
+      passwordHash: await hashPassword(password),
+      consentAcceptedAt: new Date(),
+      consentVersion: CURRENT_CONSENT_VERSION,
+    },
   })
 
-  const token = signToken({ id: user.id, role: 'user' })
-  res.status(201).json({ token, user: { id: user.id, fullName: user.fullName, email: user.email } })
+  const session = await issueSession({ id: user.id, role: 'user' })
+  res.status(201).json({ ...session, user: { id: user.id, fullName: user.fullName, email: user.email } })
 })
 
-authRouter.post('/user/login', async (req, res) => {
+authRouter.post('/user/login', loginLimiter, async (req, res) => {
   const parsed = loginSchema.safeParse(req.body)
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() })
 
@@ -44,16 +77,13 @@ authRouter.post('/user/login', async (req, res) => {
     return res.status(401).json({ error: 'Invalid email or password.' })
   }
 
-  const token = signToken({ id: user.id, role: 'user' })
-  res.json({ token, user: { id: user.id, fullName: user.fullName, email: user.email } })
+  await issueOtp(email, 'user')
+  res.json({ otpRequired: true, email })
 })
 
 // --- Professional ---
-// Note: in a real MVP, professional registration should not immediately grant
-// a usable account — it should create an unverified record and require
-// admin verification (credentials check) before `verified: true`.
 
-authRouter.post('/professional/register', async (req, res) => {
+authRouter.post('/professional/register', registerLimiter, async (req, res) => {
   const parsed = registerSchema.safeParse(req.body)
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() })
 
@@ -71,14 +101,14 @@ authRouter.post('/professional/register', async (req, res) => {
     },
   })
 
-  const token = signToken({ id: professional.id, role: 'professional' })
+  const session = await issueSession({ id: professional.id, role: 'professional' })
   res.status(201).json({
-    token,
+    ...session,
     professional: { id: professional.id, fullName: professional.fullName, verified: professional.verified },
   })
 })
 
-authRouter.post('/professional/login', async (req, res) => {
+authRouter.post('/professional/login', loginLimiter, async (req, res) => {
   const parsed = loginSchema.safeParse(req.body)
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() })
 
@@ -88,20 +118,13 @@ authRouter.post('/professional/login', async (req, res) => {
     return res.status(401).json({ error: 'Invalid email or password.' })
   }
 
-  const token = signToken({ id: professional.id, role: 'professional' })
-  res.json({
-    token,
-    professional: { id: professional.id, fullName: professional.fullName, verified: professional.verified },
-  })
+  await issueOtp(email, 'professional')
+  res.json({ otpRequired: true, email })
 })
 
 // --- Admin ---
-// Deliberately no self-registration route. Admin accounts touch the safety
-// queue and platform-wide data, so they're provisioned out-of-band (seed
-// script, or a future internal-only provisioning process) rather than
-// through a public signup form.
 
-authRouter.post('/admin/login', async (req, res) => {
+authRouter.post('/admin/login', loginLimiter, async (req, res) => {
   const parsed = loginSchema.safeParse(req.body)
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() })
 
@@ -111,6 +134,81 @@ authRouter.post('/admin/login', async (req, res) => {
     return res.status(401).json({ error: 'Invalid email or password.' })
   }
 
-  const token = signToken({ id: admin.id, role: 'admin', adminRole: admin.role })
-  res.json({ token, admin: { id: admin.id, fullName: admin.fullName, role: admin.role } })
+  await issueOtp(email, 'admin')
+  res.json({ otpRequired: true, email })
+})
+
+// --- Shared OTP verification ---
+
+const verifyOtpSchema = z.object({
+  role: z.enum(['user', 'professional', 'admin']),
+  email: z.string().email(),
+  code: z.string().length(6),
+})
+
+authRouter.post('/verify-otp', otpVerifyLimiter, async (req, res) => {
+  const parsed = verifyOtpSchema.safeParse(req.body)
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() })
+
+  const { role, email, code } = parsed.data
+
+  const otp = await prisma.loginOtp.findFirst({
+    where: { email, role, consumedAt: null, expiresAt: { gt: new Date() } },
+    orderBy: { createdAt: 'desc' },
+  })
+
+  if (!otp || otp.codeHash !== hashOtpCode(code)) {
+    return res.status(401).json({ error: 'Invalid or expired code.' })
+  }
+
+  await prisma.loginOtp.update({ where: { id: otp.id }, data: { consumedAt: new Date() } })
+
+  if (role === 'user') {
+    const user = await prisma.user.findUnique({ where: { email } })
+    if (!user) return res.status(404).json({ error: 'Account not found.' })
+    const session = await issueSession({ id: user.id, role: 'user' })
+    return res.json({ ...session, user: { id: user.id, fullName: user.fullName, email: user.email } })
+  }
+
+  if (role === 'professional') {
+    const professional = await prisma.professional.findUnique({ where: { email } })
+    if (!professional) return res.status(404).json({ error: 'Account not found.' })
+    const session = await issueSession({ id: professional.id, role: 'professional' })
+    return res.json({
+      ...session,
+      professional: { id: professional.id, fullName: professional.fullName, verified: professional.verified },
+    })
+  }
+
+  const admin = await prisma.admin.findUnique({ where: { email } })
+  if (!admin) return res.status(404).json({ error: 'Account not found.' })
+  const session = await issueSession({ id: admin.id, role: 'admin', adminRole: admin.role })
+  res.json({ ...session, admin: { id: admin.id, fullName: admin.fullName, role: admin.role } })
+})
+
+// --- Session management ---
+
+const refreshSchema = z.object({ refreshToken: z.string().min(1) })
+
+authRouter.post('/refresh', async (req, res) => {
+  const parsed = refreshSchema.safeParse(req.body)
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() })
+
+  const session = await refreshSession(parsed.data.refreshToken)
+  if (!session) return res.status(401).json({ error: 'Session expired. Please log in again.' })
+
+  res.json(session)
+})
+
+authRouter.post('/logout', async (req, res) => {
+  const parsed = refreshSchema.safeParse(req.body)
+  if (parsed.success) {
+    await revokeRefreshToken(parsed.data.refreshToken)
+  }
+  res.json({ loggedOut: true })
+})
+
+authRouter.post('/logout-all', requireAuth, async (req, res) => {
+  await revokeAllSessions(req.auth.role, req.auth.id)
+  res.json({ loggedOut: true })
 })

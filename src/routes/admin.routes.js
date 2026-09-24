@@ -6,8 +6,6 @@ import { audit } from '../lib/audit.js'
 
 export const adminRouter = Router()
 
-// Every admin tier can see the platform overview — it's high-level counts,
-// no clinical or account-identifiable detail.
 adminRouter.get(
   '/overview',
   requireAuth,
@@ -32,8 +30,6 @@ adminRouter.get(
   }
 )
 
-// Safety queue: clinical data, restricted to platform admin and the
-// clinical safety reviewer role specifically — never SUPPORT.
 adminRouter.get(
   '/safety',
   requireAuth,
@@ -101,7 +97,6 @@ adminRouter.patch(
   }
 )
 
-// --- Patient list: account-support scope, not clinical scope ---
 adminRouter.get(
   '/users',
   requireAuth,
@@ -117,8 +112,6 @@ adminRouter.get(
           prisma.checkIn.findFirst({ where: { userId: u.id }, orderBy: { completedAt: 'desc' } }),
           prisma.checkIn.count({ where: { userId: u.id } }),
         ])
-        // SUPPORT gets account-support fields only — the clinical risk
-        // level is deliberately withheld. Only PLATFORM_ADMIN sees both.
         return {
           id: u.id,
           fullName: u.fullName,
@@ -141,7 +134,6 @@ adminRouter.get(
   }
 )
 
-// --- Platform-wide appointments: account-support scope ---
 adminRouter.get(
   '/appointments',
   requireAuth,
@@ -176,10 +168,6 @@ adminRouter.get(
   }
 )
 
-// --- Professional management ---
-// Viewing the roster (including unverified ones) is open to the clinical
-// reviewer too. Actually verifying/unverifying is a platform-level trust
-// decision — PLATFORM_ADMIN only.
 adminRouter.get(
   '/professionals',
   requireAuth,
@@ -230,11 +218,6 @@ adminRouter.patch(
   }
 )
 
-// --- Platform-wide referrals ---
-// Kept pseudonymous (no patient name/email) even for admin roles — this is
-// clinical screening data, and the "Anonymous User #xxxx" convention here
-// matches what professionals see on their own referral queue, for
-// consistency in how identity is handled around clinical content.
 adminRouter.get(
   '/referrals',
   requireAuth,
@@ -268,11 +251,6 @@ adminRouter.get(
   }
 )
 
-// --- Analytics ---
-// Business-sensitive — PLATFORM_ADMIN only, same tier as Institutions.
-// Built from what actually exists in the database today, not fabricated
-// trend lines — with a small real user base, honest current-state numbers
-// are more useful than invented month-over-month "growth."
 adminRouter.get(
   '/analytics',
   requireAuth,
@@ -299,8 +277,6 @@ adminRouter.get(
       prisma.professional.count({ where: { verified: true } }),
     ])
 
-    // Bucket check-ins by calendar day in JS — simpler and more portable
-    // than a raw SQL date-trunc for a 14-day window at this scale.
     const dayBuckets = {}
     for (let i = 13; i >= 0; i--) {
       const d = new Date(Date.now() - i * 24 * 60 * 60 * 1000)
@@ -326,5 +302,91 @@ adminRouter.get(
       appointmentStatusBreakdown: appointmentStatusCounts.map((r) => ({ status: r.status, count: r._count.status })),
       professionals: { total: totalProfessionals, verified: verifiedProfessionals },
     })
+  }
+)
+
+// --- Account deletion review queue ---
+// The one place deletion requests actually get acted on. See the
+// AccountDeletionRequest and ClinicalNote comments in schema.prisma for
+// the reasoning behind review-then-delete rather than instant self-serve.
+adminRouter.get(
+  '/deletion-requests',
+  requireAuth,
+  requireAdminRole('PLATFORM_ADMIN'),
+  async (req, res) => {
+    const requests = await prisma.accountDeletionRequest.findMany({
+      orderBy: { requestedAt: 'desc' },
+    })
+
+    await audit({
+      actorType: 'admin',
+      actorId: req.auth.id,
+      action: 'admin.deletion_requests.list',
+      resourceType: 'account_deletion_request',
+    })
+
+    res.json(requests)
+  }
+)
+
+const processDeletionSchema = z.object({ action: z.enum(['DELETE', 'REJECT']) })
+
+adminRouter.patch(
+  '/deletion-requests/:id/process',
+  requireAuth,
+  requireAdminRole('PLATFORM_ADMIN'),
+  async (req, res) => {
+    const parsed = processDeletionSchema.safeParse(req.body)
+    if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() })
+
+    const request = await prisma.accountDeletionRequest.findUnique({ where: { id: req.params.id } })
+    if (!request) return res.status(404).json({ error: 'Request not found.' })
+    if (request.status !== 'PENDING') return res.status(409).json({ error: 'Request already processed.' })
+
+    // Fetch the requesting admin's email for the audit trail.
+    const admin = await prisma.admin.findUnique({ where: { id: req.auth.id } })
+
+    if (parsed.data.action === 'REJECT') {
+      const updated = await prisma.accountDeletionRequest.update({
+        where: { id: request.id },
+        data: { status: 'REJECTED', processedAt: new Date(), processedByEmail: admin?.email },
+      })
+
+      await audit({
+        actorType: 'admin',
+        actorId: req.auth.id,
+        action: 'deletion_request.reject',
+        resourceType: 'account_deletion_request',
+        resourceId: request.id,
+      })
+
+      return res.json(updated)
+    }
+
+    // DELETE: actually remove the account. Cascades (see schema.prisma)
+    // handle check-ins, referrals, appointments, and — for professionals —
+    // documents. Clinical notes referencing this userId are deliberately
+    // left in place; see the ClinicalNote comment in schema.prisma.
+    if (request.role === 'user') {
+      await prisma.user.delete({ where: { id: request.accountId } }).catch(() => null)
+    } else {
+      await prisma.professional.delete({ where: { id: request.accountId } }).catch(() => null)
+    }
+
+    const updated = await prisma.accountDeletionRequest.update({
+      where: { id: request.id },
+      data: { status: 'COMPLETED', processedAt: new Date(), processedByEmail: admin?.email },
+    })
+
+    await audit({
+      actorType: 'admin',
+      actorId: req.auth.id,
+      action: 'deletion_request.complete',
+      resourceType: 'account_deletion_request',
+      resourceId: request.id,
+      metadata: { deletedRole: request.role, deletedAccountId: request.accountId },
+    })
+
+    res.json(updated)
   }
 )
