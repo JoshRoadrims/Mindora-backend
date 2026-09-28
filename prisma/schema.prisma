@@ -98,6 +98,34 @@ enum DeletionRequestStatus {
   REJECTED
 }
 
+enum GroupTopic {
+  ANXIETY
+  DEPRESSION
+  GRIEF
+  STRESS
+  RELATIONSHIPS
+  SUBSTANCE_USE
+  OTHER
+}
+
+enum GroupStatus {
+  ACTIVE
+  PAUSED
+  ARCHIVED
+}
+
+enum MembershipStatus {
+  PENDING
+  ACTIVE
+  REMOVED
+  LEFT
+}
+
+enum ReportStatus {
+  OPEN
+  RESOLVED
+}
+
 // ---------------------------------------------------------------------------
 // Identity
 // ---------------------------------------------------------------------------
@@ -114,12 +142,13 @@ model User {
   createdAt         DateTime  @default(now())
   updatedAt         DateTime  @updatedAt
 
-  checkIns      CheckIn[]
-  referrals     Referral[]
-  appointments  Appointment[]
-  auditLogs     AuditLog[]
-  reviews       Review[]
-  sentMessages  Message[] @relation("MessagesSentByUser")
+  checkIns         CheckIn[]
+  referrals        Referral[]
+  appointments     Appointment[]
+  auditLogs        AuditLog[]
+  reviews          Review[]
+  sentMessages     Message[] @relation("MessagesSentByUser")
+  groupMemberships GroupMembership[]
 
   @@map("users")
 }
@@ -152,6 +181,7 @@ model Professional {
   documents       ProfessionalDocument[]
   reviews         Review[]
   sentMessages    Message[] @relation("MessagesSentByProfessional")
+  supportGroups   SupportGroup[]
 
   @@map("professionals")
 }
@@ -331,17 +361,111 @@ model Message {
 }
 
 // ---------------------------------------------------------------------------
+// Support groups — facilitated by a verified professional, never peer-only.
+//
+// Privacy design:
+// - Members only ever see each other's pseudonyms. The facilitator sees real
+//   names by joining membership -> user, since they hold the duty of care.
+// - GroupMembership.userId uses SetNull: when a person's account is deleted,
+//   their membership row and posts stay, and the app shows them as
+//   "Former member". The link back to the person is what gets cut.
+// - If a facilitator's account is deleted, their groups are deleted with
+//   them (Cascade). Archive groups first if members should be handled
+//   gently.
+// ---------------------------------------------------------------------------
+
+model SupportGroup {
+  id             String       @id @default(uuid())
+  facilitatorId  String
+  facilitator    Professional @relation(fields: [facilitatorId], references: [id], onDelete: Cascade)
+  title          String
+  topic          GroupTopic
+  description    String
+  rules          String?
+  maxMembers     Int          @default(12)
+  status         GroupStatus  @default(ACTIVE)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  memberships    GroupMembership[]
+  messages       GroupMessage[]
+
+  @@index([facilitatorId])
+  @@index([status, topic])
+  @@map("support_groups")
+}
+
+model GroupMembership {
+  id                String           @id @default(uuid())
+  groupId           String
+  group             SupportGroup     @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  userId            String?
+  user              User?            @relation(fields: [userId], references: [id], onDelete: SetNull)
+  pseudonym         String
+  status            MembershipStatus @default(PENDING)
+  consentAcceptedAt DateTime
+  consentVersion    String
+  createdAt         DateTime         @default(now())
+  joinedAt          DateTime?
+  updatedAt         DateTime         @updatedAt
+
+  messages          GroupMessage[]
+  reports           GroupReport[]
+
+  @@unique([groupId, userId])
+  @@unique([groupId, pseudonym])
+  @@index([userId])
+  @@map("group_memberships")
+}
+
+model GroupMessage {
+  id                    String           @id @default(uuid())
+  groupId               String
+  group                 SupportGroup     @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  membershipId          String?
+  membership            GroupMembership? @relation(fields: [membershipId], references: [id], onDelete: Cascade)
+  authoredByFacilitator Boolean          @default(false)
+  content               String
+  flagged               Boolean          @default(false)
+  hidden                Boolean          @default(false)
+  hiddenAt              DateTime?
+  createdAt             DateTime         @default(now())
+
+  reports               GroupReport[]
+
+  @@index([groupId, createdAt])
+  @@map("group_messages")
+}
+
+model GroupReport {
+  id                   String          @id @default(uuid())
+  messageId            String
+  message              GroupMessage    @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  reporterMembershipId String
+  reporter             GroupMembership @relation(fields: [reporterMembershipId], references: [id], onDelete: Cascade)
+  reason               String?
+  status               ReportStatus    @default(OPEN)
+  createdAt            DateTime        @default(now())
+  resolvedAt           DateTime?
+
+  @@unique([messageId, reporterMembershipId])
+  @@index([status])
+  @@map("group_reports")
+}
+
+// ---------------------------------------------------------------------------
 // Safety / escalation
 // ---------------------------------------------------------------------------
 
 model SafetyAlert {
-  id          String    @id @default(uuid())
-  referralId  String?
-  userId      String?
-  riskLevel   RiskLevel
-  note        String
-  resolvedAt  DateTime?
-  createdAt   DateTime  @default(now())
+  id             String    @id @default(uuid())
+  referralId     String?
+  userId         String?
+  groupMessageId String?
+  riskLevel      RiskLevel
+  note           String
+  resolvedAt     DateTime?
+  createdAt      DateTime  @default(now())
 
   @@index([riskLevel, resolvedAt])
   @@map("safety_alerts")
