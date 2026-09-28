@@ -30,8 +30,18 @@ const loginSchema = z.object({
   password: z.string().min(1),
 })
 
+// TEMPORARY, staging-only: when DISABLE_OTP=true on the server, user and
+// professional logins accept the fixed code 000000 instead of an emailed
+// code. Admin logins always need the real emailed code. Never set this on
+// production.
+const OTP_DISABLED = process.env.DISABLE_OTP === 'true'
+if (OTP_DISABLED) {
+  console.warn('[auth] DISABLE_OTP is on: user/professional logins accept the fixed test code 000000')
+}
+
 async function issueOtp(email, role) {
-  const code = generateOtpCode()
+  const useTestCode = OTP_DISABLED && role !== 'admin'
+  const code = useTestCode ? '000000' : generateOtpCode()
   await prisma.loginOtp.create({
     data: {
       email,
@@ -40,7 +50,7 @@ async function issueOtp(email, role) {
       expiresAt: otpExpiryDate(),
     },
   })
-  await sendOtpEmail(email, code)
+  if (!useTestCode) await sendOtpEmail(email, code)
 }
 
 // --- User ---
