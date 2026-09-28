@@ -22,8 +22,26 @@ import { messageRouter } from './routes/message.routes.js'
 
 const app = express()
 
+// CORS_ORIGIN can hold one address or several separated by commas, e.g.
+// "https://patients.example.com,https://pro.example.com". A trailing slash
+// on any entry is ignored, since browsers never send one.
+const allowedOrigins = (process.env.CORS_ORIGIN || 'http://localhost:5173')
+  .split(',')
+  .map((origin) => origin.trim().replace(/\/$/, ''))
+  .filter(Boolean)
+
 app.use(helmet())
-app.use(cors({ origin: process.env.CORS_ORIGIN || 'http://localhost:5173', credentials: true }))
+app.use(
+  cors({
+    origin(origin, callback) {
+      // Requests with no Origin header (health checks, curl) are not
+      // browser cross-site requests, so they pass through.
+      if (!origin) return callback(null, true)
+      return callback(null, allowedOrigins.includes(origin))
+    },
+    credentials: true,
+  })
+)
 app.use(express.json())
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'))
 app.use(attachAuth)
