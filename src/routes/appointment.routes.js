@@ -3,6 +3,7 @@ import { z } from 'zod'
 import { prisma } from '../lib/prisma.js'
 import { requireAuth, requireRole, requireAgreement } from '../middleware/auth.js'
 import { audit } from '../lib/audit.js'
+import { calculatePlatformFeeKes } from '../lib/pricing.js'
 
 export const appointmentRouter = Router()
 
@@ -62,18 +63,30 @@ appointmentRouter.post('/', requireAuth, requireRole('user'), async (req, res) =
 
   // If the patient is linked to an ACTIVE institution, that institution
   // covers coveragePercent% of the fee (capped at the full fee) — this is
-  // the corporate EAP / student-discount mechanism.
+  // the corporate EAP / student-discount mechanism. institutionType is
+  // only set when real sponsorship is actually happening (below), not
+  // merely because the patient has *a* linked institution — an inactive
+  // link or 0% coverage is a standard self-pay booking in every respect
+  // that matters for pricing.
   const user = await prisma.user.findUnique({ where: { id: req.auth.id }, include: { institution: true } })
   let sponsoringInstitutionId = null
   let institutionCoveredKes = 0
+  let institutionType = null
 
   if (user?.institution && user.institution.status === 'ACTIVE' && user.institution.coveragePercent > 0) {
     sponsoringInstitutionId = user.institution.id
+    institutionType = user.institution.type
     institutionCoveredKes = Math.min(
       fullFee,
       Math.round((fullFee * user.institution.coveragePercent) / 100)
     )
   }
+
+  // Platform commission: 35% on standard and student (UNIVERSITY-sponsored)
+  // bookings. Corporate/EAP bookings are exempt — Mindora earns from those
+  // through a separate employer retainer, not a per-booking cut. See
+  // src/lib/pricing.js for the full reasoning.
+  const platformFeeKes = calculatePlatformFeeKes(fullFee, institutionType)
 
   const appointment = await prisma.appointment.create({
     data: {
@@ -82,6 +95,7 @@ appointmentRouter.post('/', requireAuth, requireRole('user'), async (req, res) =
       scheduledFor: requestedTime,
       type,
       feeKes: fullFee,
+      platformFeeKes,
       sponsoringInstitutionId,
       institutionCoveredKes,
     },
@@ -101,7 +115,7 @@ appointmentRouter.post('/', requireAuth, requireRole('user'), async (req, res) =
     action: 'appointment.book',
     resourceType: 'appointment',
     resourceId: appointment.id,
-    metadata: sponsoringInstitutionId ? { institutionCoveredKes } : undefined,
+    metadata: sponsoringInstitutionId ? { institutionCoveredKes, platformFeeKes } : { platformFeeKes },
   })
 
   res.status(201).json(finalAppointment)

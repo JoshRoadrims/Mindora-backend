@@ -272,6 +272,7 @@ model Appointment {
   type                    AppointmentType
   status                  AppointmentStatus @default(SCHEDULED)
   feeKes                  Int
+  platformFeeKes          Int               @default(0)
   meetingUrl              String?
   sponsoringInstitutionId String?
   sponsoringInstitution   Institution?      @relation(fields: [sponsoringInstitutionId], references: [id], onDelete: SetNull)
