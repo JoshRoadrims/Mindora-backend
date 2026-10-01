@@ -126,6 +126,12 @@ enum ReportStatus {
   RESOLVED
 }
 
+enum PaymentStatus {
+  PENDING
+  PAID
+  FAILED
+}
+
 // ---------------------------------------------------------------------------
 // Identity
 // ---------------------------------------------------------------------------
@@ -182,6 +188,7 @@ model Professional {
   reviews         Review[]
   sentMessages    Message[] @relation("MessagesSentByProfessional")
   supportGroups   SupportGroup[]
+  payouts         Payout[]
 
   @@map("professionals")
 }
@@ -278,12 +285,16 @@ model Appointment {
   sponsoringInstitution   Institution?      @relation(fields: [sponsoringInstitutionId], references: [id], onDelete: SetNull)
   institutionCoveredKes   Int               @default(0)
   reminderSentAt          DateTime?
+  payoutId                String?
+  payout                  Payout?           @relation(fields: [payoutId], references: [id], onDelete: SetNull)
   createdAt               DateTime          @default(now())
 
   review                  Review?
+  payment                 Payment?
 
   @@index([professionalId, scheduledFor])
   @@index([userId, scheduledFor])
+  @@index([payoutId])
   @@map("appointments")
 }
 
@@ -430,7 +441,7 @@ model GroupMessage {
   flagged               Boolean          @default(false)
   hidden                Boolean          @default(false)
   hiddenAt              DateTime?
-  createdAt             DateTime         @default(now())
+  createdAt              DateTime        @default(now())
 
   reports               GroupReport[]
 
@@ -452,6 +463,62 @@ model GroupReport {
   @@unique([messageId, reporterMembershipId])
   @@index([status])
   @@map("group_reports")
+}
+
+// ---------------------------------------------------------------------------
+// Payments — one per appointment, tracking the patient's M-Pesa STK Push
+// transaction. PENDING is created the moment the push is sent to the
+// patient's phone; PAID/FAILED are set only from Safaricom's callback,
+// never from the frontend, since the frontend cannot be trusted to know
+// whether money actually moved. rawCallback is kept for audit/debugging —
+// Safaricom's callback payloads vary and this is the only honest record
+// of exactly what they sent.
+// ---------------------------------------------------------------------------
+
+model Payment {
+  id                String        @id @default(uuid())
+  appointmentId     String        @unique
+  appointment       Appointment   @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+  phoneNumber       String
+  amountKes         Int
+  status            PaymentStatus @default(PENDING)
+  merchantRequestId String?
+  checkoutRequestId String?       @unique
+  mpesaReceiptNumber String?
+  resultDesc        String?
+  rawCallback       Json?
+  paidAt            DateTime?
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+
+  @@index([status])
+  @@map("payments")
+}
+
+// ---------------------------------------------------------------------------
+// Payouts — a settlement batch, created by an admin when they manually pay
+// a professional (bank transfer, M-Pesa send, etc. — outside the app for
+// now, per the founder's choice to avoid per-session B2C disbursement
+// fees). Appointments get linked to a Payout once included in one; an
+// appointment with payoutId = null and a PAID payment is "owed, not yet
+// settled" — that's the whole ledger logic.
+// ---------------------------------------------------------------------------
+
+model Payout {
+  id             String       @id @default(uuid())
+  professionalId String
+  professional   Professional @relation(fields: [professionalId], references: [id], onDelete: Cascade)
+  amountKes      Int
+  method         String
+  reference      String?
+  note           String?
+  paidAt         DateTime     @default(now())
+  createdAt      DateTime     @default(now())
+
+  appointments   Appointment[]
+
+  @@index([professionalId])
+  @@map("payouts")
 }
 
 // ---------------------------------------------------------------------------
