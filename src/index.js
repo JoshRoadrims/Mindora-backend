@@ -21,6 +21,7 @@ import { reviewRouter } from './routes/review.routes.js'
 import { messageRouter } from './routes/message.routes.js'
 import { groupRouter } from './routes/group.routes.js'
 import { paymentRouter } from './routes/payment.routes.js'
+import { studentRateRouter } from './routes/studentRate.routes.js'
 
 const app = express()
 
@@ -66,6 +67,7 @@ app.use('/api/reviews', reviewRouter)
 app.use('/api/messages', messageRouter)
 app.use('/api/groups', groupRouter)
 app.use('/api/payments', paymentRouter)
+app.use('/api/student-rate', studentRateRouter)
 
 // Centralised error handler — keeps stack traces out of prod responses.
 app.use((err, _req, res, _next) => {

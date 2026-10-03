@@ -4,17 +4,39 @@ import { prisma } from '../lib/prisma.js'
 import { requireAuth, requireRole } from '../middleware/auth.js'
 import { audit } from '../lib/audit.js'
 import { CURRENT_AGREEMENT_VERSION } from '../lib/agreement.js'
+import { STUDENT_RATE_FEE_CAP_KES } from '../lib/pricing.js'
 
 export const professionalRouter = Router()
 
 // Any authenticated person (user or professional) can browse the directory.
-// Only verified professionals are ever listed publicly.
-professionalRouter.get('/', requireAuth, async (_req, res) => {
+// Only verified professionals are ever listed publicly. When the requester
+// is a Student Rate-eligible patient, professionals who've opted into the
+// tier (studentRateFeeKes set) and are less experienced/junior
+// (yearsExperience < 3 — the practical stand-in for "freelance," since
+// Mindora doesn't track employment type as its own concept) are sorted
+// first. This is a soft preference, not a filter — every verified
+// professional still appears, eligible or not.
+professionalRouter.get('/', requireAuth, async (req, res) => {
   const professionals = await prisma.professional.findMany({
     where: { verified: true },
     orderBy: { createdAt: 'asc' },
   })
-  res.json(professionals)
+
+  let studentRateEligible = false
+  if (req.auth.role === 'user') {
+    const user = await prisma.user.findUnique({ where: { id: req.auth.id }, select: { studentRateEligible: true } })
+    studentRateEligible = user?.studentRateEligible ?? false
+  }
+
+  if (!studentRateEligible) return res.json(professionals)
+
+  const sorted = [...professionals].sort((a, b) => {
+    const aPriority = a.studentRateFeeKes != null && a.yearsExperience < 3
+    const bPriority = b.studentRateFeeKes != null && b.yearsExperience < 3
+    if (aPriority === bPriority) return 0
+    return aPriority ? -1 : 1
+  })
+  res.json(sorted)
 })
 
 // Agreement status — placed before '/:id' would also be fine here since
@@ -77,6 +99,11 @@ const updateProfileSchema = z.object({
   yearsExperience: z.number().int().min(0).max(70).optional(),
   location: z.string().optional(),
   feeKes: z.number().int().min(0).optional(),
+  // null explicitly opts back out of the Student Rate tier; omitting the
+  // field leaves it unchanged, same convention as every other optional
+  // field here.
+  studentRateFeeKes: z.number().int().min(1).max(STUDENT_RATE_FEE_CAP_KES).nullable().optional(),
+  supervisorName: z.string().max(200).nullable().optional(),
   onlineAvailable: z.boolean().optional(),
   inPersonAvailable: z.boolean().optional(),
 })

@@ -65,15 +65,33 @@ checkInRouter.post('/', requireAuth, requireRole('user'), async (req, res) => {
 
   let referral = null
   if (riskLevel === 'ELEVATED' || riskLevel === 'HIGH' || riskLevel === 'ACUTE') {
-    // Placeholder assignment: hand the referral to the first verified
-    // professional. A real MVP needs a proper matching/routing algorithm
-    // (specialty, availability, caseload) — this exists so the referral
-    // actually reaches a professional's queue in this prototype rather
-    // than sitting unassigned.
-    const professional = await prisma.professional.findFirst({
-      where: { verified: true },
-      orderBy: { createdAt: 'asc' },
-    })
+    // Placeholder assignment: a real MVP needs a proper matching/routing
+    // algorithm (specialty, availability, caseload) — this exists so the
+    // referral actually reaches a professional's queue in this prototype
+    // rather than sitting unassigned.
+    //
+    // One real piece of routing logic: a HIGH/ACUTE result for a Student
+    // Rate-eligible patient prefers an experienced professional
+    // (yearsExperience >= 3) first, falling back to "first verified" if
+    // none is available — a serious result shouldn't default to the most
+    // junior professional on the platform just because they happen to be
+    // the ones who opted into the discounted tier.
+    const user = await prisma.user.findUnique({ where: { id: req.auth.id }, select: { studentRateEligible: true } })
+    const preferExperienced = user?.studentRateEligible && (riskLevel === 'HIGH' || riskLevel === 'ACUTE')
+
+    let professional = null
+    if (preferExperienced) {
+      professional = await prisma.professional.findFirst({
+        where: { verified: true, yearsExperience: { gte: 3 } },
+        orderBy: { createdAt: 'asc' },
+      })
+    }
+    if (!professional) {
+      professional = await prisma.professional.findFirst({
+        where: { verified: true },
+        orderBy: { createdAt: 'asc' },
+      })
+    }
 
     referral = await prisma.referral.create({
       data: {

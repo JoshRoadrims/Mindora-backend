@@ -132,29 +132,42 @@ enum PaymentStatus {
   FAILED
 }
 
+enum StudentRateMethod {
+  STUDENT_EMAIL
+  YOUNG_ADULT_ID
+}
+
+enum StudentRateStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
 // ---------------------------------------------------------------------------
 // Identity
 // ---------------------------------------------------------------------------
 
 model User {
-  id                String    @id @default(uuid())
-  email             String    @unique
-  passwordHash      String
-  fullName          String
-  consentAcceptedAt DateTime?
-  consentVersion    String?
-  institutionId     String?
-  institution       Institution? @relation(fields: [institutionId], references: [id], onDelete: SetNull)
-  createdAt         DateTime  @default(now())
-  updatedAt         DateTime  @updatedAt
+  id                 String    @id @default(uuid())
+  email              String    @unique
+  passwordHash       String
+  fullName           String
+  consentAcceptedAt  DateTime?
+  consentVersion     String?
+  institutionId      String?
+  institution        Institution? @relation(fields: [institutionId], references: [id], onDelete: SetNull)
+  studentRateEligible Boolean  @default(false)
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
 
-  checkIns         CheckIn[]
-  referrals        Referral[]
-  appointments     Appointment[]
-  auditLogs        AuditLog[]
-  reviews          Review[]
-  sentMessages     Message[] @relation("MessagesSentByUser")
-  groupMemberships GroupMembership[]
+  checkIns              CheckIn[]
+  referrals             Referral[]
+  appointments          Appointment[]
+  auditLogs             AuditLog[]
+  reviews               Review[]
+  sentMessages           Message[] @relation("MessagesSentByUser")
+  groupMemberships       GroupMembership[]
+  studentRateVerifications StudentRateVerification[]
 
   @@map("users")
 }
@@ -172,6 +185,8 @@ model Professional {
   yearsExperience     Int               @default(0)
   location            String?
   feeKes              Int?
+  studentRateFeeKes   Int?
+  supervisorName      String?
   onlineAvailable     Boolean           @default(true)
   inPersonAvailable   Boolean           @default(false)
   verified            Boolean           @default(false)
@@ -280,6 +295,7 @@ model Appointment {
   status                  AppointmentStatus @default(SCHEDULED)
   feeKes                  Int
   platformFeeKes          Int               @default(0)
+  isStudentRateBooking    Boolean           @default(false)
   meetingUrl              String?
   sponsoringInstitutionId String?
   sponsoringInstitution   Institution?      @relation(fields: [sponsoringInstitutionId], references: [id], onDelete: SetNull)
@@ -441,7 +457,7 @@ model GroupMessage {
   flagged               Boolean          @default(false)
   hidden                Boolean          @default(false)
   hiddenAt              DateTime?
-  createdAt              DateTime        @default(now())
+  createdAt             DateTime         @default(now())
 
   reports               GroupReport[]
 
@@ -519,6 +535,33 @@ model Payout {
 
   @@index([professionalId])
   @@map("payouts")
+}
+
+// ---------------------------------------------------------------------------
+// Student Rate verification — a patient's self-serve path to the
+// discounted tier (KES 2,000 fee cap, 25% platform commission). Two
+// methods: a university email address, or an uploaded ID document
+// proving age 18-25 ("young adult"). Both go through the same admin
+// review queue as professional KYC, rather than being auto-approved —
+// a fake university email or a borrowed ID are both real risks worth
+// a human check, same reasoning as professional document review.
+// ---------------------------------------------------------------------------
+
+model StudentRateVerification {
+  id          String             @id @default(uuid())
+  userId      String
+  user        User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  method      StudentRateMethod
+  evidence    String             // university email address, for STUDENT_EMAIL
+  filePath    String?            // R2 object key for the ID document, for YOUNG_ADULT_ID
+  status      StudentRateStatus  @default(PENDING)
+  reviewNotes String?
+  reviewedAt  DateTime?
+  createdAt   DateTime           @default(now())
+
+  @@index([userId])
+  @@index([status])
+  @@map("student_rate_verifications")
 }
 
 // ---------------------------------------------------------------------------

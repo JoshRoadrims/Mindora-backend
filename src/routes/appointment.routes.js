@@ -59,21 +59,34 @@ appointmentRouter.post('/', requireAuth, requireRole('user'), async (req, res) =
     })
   }
 
-  const fullFee = professional.feeKes ?? 0
+  const user = await prisma.user.findUnique({ where: { id: req.auth.id }, include: { institution: true } })
+
+  // Student Rate takes priority over a listed full fee, but defers to an
+  // active institution sponsorship (employer/university coverage) if one
+  // exists — that's a stronger, separately-negotiated benefit, and
+  // stacking both would be confusing to reconcile. A patient who's both
+  // Student Rate-eligible and institution-sponsored simply uses whichever
+  // benefit the institution coverage branch below applies.
+  const hasActiveSponsorship =
+    user?.institution && user.institution.status === 'ACTIVE' && user.institution.coveragePercent > 0
+  const useStudentRate =
+    !hasActiveSponsorship && user?.studentRateEligible && professional.studentRateFeeKes != null
+
+  const fullFee = useStudentRate ? professional.studentRateFeeKes : professional.feeKes ?? 0
 
   // If the patient is linked to an ACTIVE institution, that institution
   // covers coveragePercent% of the fee (capped at the full fee) — this is
-  // the corporate EAP / student-discount mechanism. institutionType is
-  // only set when real sponsorship is actually happening (below), not
-  // merely because the patient has *a* linked institution — an inactive
-  // link or 0% coverage is a standard self-pay booking in every respect
-  // that matters for pricing.
-  const user = await prisma.user.findUnique({ where: { id: req.auth.id }, include: { institution: true } })
+  // the corporate EAP / employer-sponsored mechanism, separate from the
+  // Student Rate tier above. institutionType is only set when real
+  // sponsorship is actually happening (below), not merely because the
+  // patient has *a* linked institution — an inactive link or 0% coverage
+  // is a standard self-pay booking in every respect that matters for
+  // pricing.
   let sponsoringInstitutionId = null
   let institutionCoveredKes = 0
   let institutionType = null
 
-  if (user?.institution && user.institution.status === 'ACTIVE' && user.institution.coveragePercent > 0) {
+  if (hasActiveSponsorship) {
     sponsoringInstitutionId = user.institution.id
     institutionType = user.institution.type
     institutionCoveredKes = Math.min(
@@ -82,11 +95,10 @@ appointmentRouter.post('/', requireAuth, requireRole('user'), async (req, res) =
     )
   }
 
-  // Platform commission: 35% on standard and student (UNIVERSITY-sponsored)
-  // bookings. Corporate/EAP bookings are exempt — Mindora earns from those
-  // through a separate employer retainer, not a per-booking cut. See
-  // src/lib/pricing.js for the full reasoning.
-  const platformFeeKes = calculatePlatformFeeKes(fullFee, institutionType)
+  // Platform commission: 35% standard, 25% on a Student Rate booking,
+  // 0% on corporate/EAP bookings (Mindora earns those through a separate
+  // employer retainer instead). See src/lib/pricing.js.
+  const platformFeeKes = calculatePlatformFeeKes(fullFee, institutionType, useStudentRate)
 
   const appointment = await prisma.appointment.create({
     data: {
@@ -96,6 +108,7 @@ appointmentRouter.post('/', requireAuth, requireRole('user'), async (req, res) =
       type,
       feeKes: fullFee,
       platformFeeKes,
+      isStudentRateBooking: Boolean(useStudentRate),
       sponsoringInstitutionId,
       institutionCoveredKes,
     },
@@ -115,7 +128,11 @@ appointmentRouter.post('/', requireAuth, requireRole('user'), async (req, res) =
     action: 'appointment.book',
     resourceType: 'appointment',
     resourceId: appointment.id,
-    metadata: sponsoringInstitutionId ? { institutionCoveredKes, platformFeeKes } : { platformFeeKes },
+    metadata: {
+      platformFeeKes,
+      isStudentRateBooking: Boolean(useStudentRate),
+      ...(sponsoringInstitutionId ? { institutionCoveredKes } : {}),
+    },
   })
 
   res.status(201).json(finalAppointment)
